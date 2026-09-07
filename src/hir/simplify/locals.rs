@@ -61,10 +61,16 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
+    allow_home_slot_compaction: bool,
 ) -> bool {
     let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
         && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
         && proto.temp_debug_locals.iter().all(Option::is_none);
+    // Reusing physical slots destroys the single-definition provenance needed by
+    // table reconstruction. Let the normal HIR passes converge before doing so.
+    if compact_home_slots && !allow_home_slot_compaction {
+        return false;
+    }
     if compact_home_slots {
         facts.enable_home_slot_compaction();
     }

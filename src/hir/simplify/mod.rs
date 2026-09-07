@@ -223,6 +223,12 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         depends_on: &[LabelGoto],
         invalidates: &[LabelGoto],
     },
+    PassDescriptor {
+        name: "compact-locals",
+        phase: PassPhase::Deferred,
+        depends_on: &[TempChain, LocalBinding, BlockStructure],
+        invalidates: &[LocalBinding, TempChain],
+    },
 ];
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
@@ -280,7 +286,9 @@ pub(super) fn simplify_hir(
                             facts,
                             dialect,
                         ),
-                        8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
+                        8 => {
+                            locals::promote_temps_to_locals_in_proto_with_facts(proto, facts, false)
+                        }
                         9 => branch_control_folding::fold_branch_control_in_proto(proto),
                         10 => decision::eliminate_remaining_decisions_in_proto(proto),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
@@ -289,6 +297,9 @@ pub(super) fn simplify_hir(
                         }
                         13 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
                         14 => dead_labels::remove_unused_labels_in_proto(proto),
+                        15 => {
+                            locals::promote_temps_to_locals_in_proto_with_facts(proto, facts, true)
+                        }
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

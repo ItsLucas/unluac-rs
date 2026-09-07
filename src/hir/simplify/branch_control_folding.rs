@@ -46,12 +46,16 @@ impl HirRewritePass for BranchControlPass {
         let constant_changed = fold_constant_control(&mut block.stmts);
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
         let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
+        let alternative_guard_changed = fold_alternative_guard_routes(&mut block.stmts);
+        let leading_escape_changed = fold_leading_branch_escapes(&mut block.stmts);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
         let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
             || empty_changed
+            || alternative_guard_changed
+            || leading_escape_changed
             || terminal_changed
             || guard_changed
             || nop_changed
@@ -62,6 +66,119 @@ impl HirRewritePass for BranchControlPass {
             || fold_effect_only_call(stmt)
             || fold_leading_while_break_guard(stmt)
             || naturalize_if_polarity(stmt)
+    }
+}
+
+// `if a then goto S end; if b then goto F end; ::S::` checks b only
+// when a is false. Combine the guard without duplicating either evaluation.
+fn fold_alternative_guard_routes(stmts: &mut Vec<HirStmt>) -> bool {
+    let references = count_label_references(stmts);
+    let mut changed = false;
+    let mut index = 0;
+    while index + 2 < stmts.len() {
+        let HirStmt::Label(success) = &stmts[index + 2] else {
+            index += 1;
+            continue;
+        };
+        if !success.tbc_barriers.is_empty() || references.get(&success.id).copied() != Some(1) {
+            index += 1;
+            continue;
+        }
+        let Some(succeeds) = leading_escape_condition(&stmts[index], success.id) else {
+            index += 1;
+            continue;
+        };
+        let Some((failure, invert)) = fold_target(&stmts[index + 1], FoldKind::Guard) else {
+            index += 1;
+            continue;
+        };
+        if failure == success.id {
+            index += 1;
+            continue;
+        }
+        let HirStmt::If(guard) = &stmts[index + 1] else {
+            unreachable!();
+        };
+        let fails = normalize_condition_context(&guard.cond, invert).expr;
+        let combined = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: normalize_condition_context(&succeeds, true).expr,
+                rhs: fails,
+            })),
+            then_block: HirBlock {
+                stmts: vec![HirStmt::Goto(Box::new(crate::hir::HirGoto {
+                    target: failure,
+                }))],
+            },
+            else_block: None,
+        }));
+        stmts.splice(index..index + 3, [combined]);
+        changed = true;
+        index = index.saturating_sub(2);
+    }
+    changed
+}
+
+// A leading guard may jump to the label immediately after its containing if:
+// `if a then if b then goto L end; body end; ::L::`. Move only the guard
+// into the condition, preserving short-circuit evaluation and the body's scope.
+fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
+    let mut changed = false;
+    for index in 0..stmts.len().saturating_sub(1) {
+        let HirStmt::Label(label) = &stmts[index + 1] else {
+            continue;
+        };
+        if !label.tbc_barriers.is_empty() {
+            continue;
+        }
+        let target = label.id;
+        let HirStmt::If(branch) = &mut stmts[index] else {
+            continue;
+        };
+        if branch
+            .else_block
+            .as_ref()
+            .is_some_and(|block| !block.stmts.is_empty())
+        {
+            continue;
+        }
+        let Some(guard) = branch.then_block.stmts.first() else {
+            continue;
+        };
+        let Some(escape) = leading_escape_condition(guard, target) else {
+            continue;
+        };
+        branch.cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: std::mem::replace(&mut branch.cond, HirExpr::Boolean(false)),
+            rhs: normalize_condition_context(&escape, true).expr,
+        }));
+        branch.then_block.stmts.remove(0);
+        changed = true;
+    }
+    changed
+}
+
+fn leading_escape_condition(stmt: &HirStmt, target: HirLabelId) -> Option<HirExpr> {
+    let HirStmt::If(guard) = stmt else {
+        return None;
+    };
+    if guard
+        .else_block
+        .as_ref()
+        .is_some_and(|block| !block.stmts.is_empty())
+    {
+        return None;
+    }
+    let [child] = guard.then_block.stmts.as_slice() else {
+        return None;
+    };
+    match child {
+        HirStmt::Goto(jump) if jump.target == target => Some(guard.cond.clone()),
+        HirStmt::If(_) => Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: guard.cond.clone(),
+            rhs: leading_escape_condition(child, target)?,
+        }))),
+        _ => None,
     }
 }
 

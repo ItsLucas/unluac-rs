@@ -430,7 +430,7 @@ impl TableConstructorPass<'_> {
             // same statement index therefore preserves allocation and field-evaluation order.
             // This path intentionally accepts observable field expressions (unlike the
             // cross-stmt folding paths below): direct-seed provenance plus the no-mention,
-            // capture and debug gates establish that the fresh owner is still only an
+            // and debug gates establish that the fresh owner is still only an
             // initializer result while those expressions run.
             if let Some(seed_index) =
                 self.find_adjacent_local_constructor_seed(block, index, binding, &set_list)
@@ -599,17 +599,15 @@ impl TableConstructorPass<'_> {
         let HirStmt::LocalDecl(local_decl) = block.stmts.get(seed_index)? else {
             return None;
         };
+        // A capture appearing after initialization does not make this fresh seed
+        // shared while its fields are evaluated. Earlier mentions are rejected below,
+        // and field expressions must not reference the owner being initialized.
         if seed_binding != binding
             || local_decl.bindings.as_slice() != [local]
             || seed.trailing_multivalue.is_some()
             || constructor_has_numeric_record(seed)
             || constructor_uses_binding(seed, binding)
             || self.binding_is_shared_before_seed(block, seed_index, binding)
-            || self
-                .reference_captured_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
             || self
                 .debug_identity_bindings
                 .get(binding)
@@ -653,6 +651,12 @@ impl TableConstructorPass<'_> {
         seed: &HirTableConstructor,
         set_list: &crate::hir::common::HirTableSetList,
     ) -> bool {
+        // A fresh empty seed followed by its first fixed SETLIST reconstructs the
+        // original constructor batch, including nil holes. No existing array run is
+        // extended or rebatched here.
+        if seed.fields.is_empty() && set_list.start_index == 1 && set_list.values.tail.is_none() {
+            return true;
+        }
         let mut fields = seed.fields.clone();
         fields.extend(
             set_list

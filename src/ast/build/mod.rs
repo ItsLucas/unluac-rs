@@ -48,16 +48,43 @@ pub(crate) fn lower_ast_for_generate(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let plan_diagnostics = collect_plan_diagnostics(state.require_structure_facts()?);
-    if context.options.generate.mode == GenerateMode::Strict
-        && let Some(diagnostic) = plan_diagnostics.first()
+    let mut plan_diagnostics = collect_plan_diagnostics(state.require_structure_facts()?);
+    let strict = context.options.generate.mode == GenerateMode::Strict;
+    if strict
+        && let Some(diagnostic) = plan_diagnostics
+            .iter()
+            .find(|diagnostic| matches!(diagnostic, PlanDiagnostic::UnresolvedValue { .. }))
     {
         return Err(diagnostic
             .strict_error(context.requested_target.version)
             .into());
     }
     let hir = state.require_hir()?;
-    let mut ast = lower_ast(hir, context.requested_target, context.options.generate.mode)?;
+    // StructurePlan precedes HIR simplification. Its transfer requirements can be
+    // stale once HIR has folded branches and removed their labels. Validate the
+    // remaining statements, retaining the existing diagnostic for real failures.
+    let mut ast = lower_ast(hir, context.requested_target, context.options.generate.mode).map_err(
+        |error| {
+            if strict && let AstLowerError::UnsupportedFeature { feature, .. } = &error {
+                let required = match *feature {
+                    "goto" | "label" => Some(ControlFlowFeature::GotoLabel),
+                    "continue" => Some(ControlFlowFeature::ContinueStatement),
+                    _ => None,
+                };
+                if let Some(diagnostic) = plan_diagnostics.iter().find(|diagnostic| {
+                    matches!(diagnostic, PlanDiagnostic::UnavailableFeature { feature, .. }
+                        if Some(*feature) == required)
+                }) {
+                    return diagnostic.strict_error(context.requested_target.version);
+                }
+            }
+            error
+        },
+    )?;
+    if strict {
+        plan_diagnostics
+            .retain(|diagnostic| !matches!(diagnostic, PlanDiagnostic::UnavailableFeature { .. }));
+    }
     if !plan_diagnostics.is_empty() {
         ast.body.stmts.insert(
             0,
