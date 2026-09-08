@@ -1,0 +1,94 @@
+//! For-loop ownership and zero/normal/break live-out state.
+use super::*;
+
+const fn debug(entry: LuaCaseMatrixEntry) -> LuaCaseMatrixEntry {
+    entry
+        .with_variants(&[LuaCaseVariant::NamingDebugLike])
+        .with_options(LuaCaseOptions {
+            retain_debug: true,
+            ..LuaCaseOptions::DEFAULT
+        })
+}
+
+pub(super) const REGRESSION_CASES_377_386: &[LuaCaseMatrixEntry] = &[
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_377_numeric_break_liveout.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_377_numeric_break_liveout.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_378_numeric_branch_shared_exit.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_378_numeric_branch_shared_exit.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_379_numeric_break_carried.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_379_numeric_break_carried.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_380_numeric_break_upvalues.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_380_numeric_break_upvalues.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_381_generic_break_liveout.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_381_generic_break_liveout.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_382_branch_loop_cleanup.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_382_branch_loop_cleanup.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_383_nested_break_liveout.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_383_nested_break_liveout.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_384_numeric_break_effects.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_384_numeric_break_effects.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_385_numeric_common_break_default.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_385_numeric_common_break_default.lua",
+        PUC_LUA_ALL,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_386_loop_shared_fence_tail.lua",
+        PUC_LUA_ALL,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_386_loop_shared_fence_tail.lua",
+        PUC_LUA_ALL,
+    )),
+];

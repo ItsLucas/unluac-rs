@@ -325,7 +325,7 @@ impl ConstructorBuilder {
     }
 }
 
-fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
+pub(super) fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
     match key {
         HirTableKey::Name(_) => Some(None),
         HirTableKey::Expr(HirExpr::Integer(value)) => Some(Some(*value)),

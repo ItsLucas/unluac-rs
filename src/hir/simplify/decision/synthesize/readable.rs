@@ -56,9 +56,13 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     let mut changed = false;
     for _ in 0..MAX_NATURALIZE_ROUNDS {
         let current_cost = super::expr_cost(&current);
+        let current_size = super::cost::structural_expr_cost(&current);
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()
             .map(normalize_candidate_expr)
+            // Condition folding factors shared operands back out. A readability
+            // preference must not expand them again and oscillate across passes.
+            .filter(|candidate| super::cost::structural_expr_cost(candidate) <= current_size)
             .filter(|candidate| {
                 validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
             })

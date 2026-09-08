@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 mod eliminate;
 mod eliminate_materialize;
 mod eliminate_state;
+mod guard_chains;
 mod helpers;
 mod synthesize;
 
@@ -103,13 +104,15 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
     }
 
     let mut nodes = decision.nodes.clone();
+    let incoming = decision_incoming_counts(decision);
     let mut replacements = vec![None; nodes.len()];
     let mut changed = false;
 
     for index in (0..nodes.len()).rev() {
         let node_ref = HirDecisionNodeRef(index);
         let mut node = nodes[index].clone();
-        let mut node_changed = false;
+        let mut node_changed =
+            guard_chains::merge_single_entry_guard(&nodes, &incoming, &mut node);
 
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
             && nodes
@@ -835,8 +838,16 @@ pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> b
         return false;
     }
 
+    decision_incoming_counts(decision)
+        .into_iter()
+        .any(|count| count > 1)
+}
+
+fn decision_incoming_counts(decision: &HirDecisionExpr) -> Vec<usize> {
     let mut incoming = vec![0usize; decision.nodes.len()];
-    incoming[decision.entry.index()] += 1;
+    if let Some(count) = incoming.get_mut(decision.entry.index()) {
+        *count += 1;
+    }
 
     for node in &decision.nodes {
         for target in [&node.truthy, &node.falsy] {
@@ -848,7 +859,7 @@ pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> b
         }
     }
 
-    incoming.into_iter().any(|count| count > 1)
+    incoming
 }
 
 pub(in crate::hir) fn decision_has_cycles(decision: &HirDecisionExpr) -> bool {

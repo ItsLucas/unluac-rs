@@ -193,9 +193,10 @@ pub(super) fn validate_edges(
                     "goto label differs from edge target",
                 ));
             }
-            EdgeTransfer::Break(region)
-                if let Some((_, fence)) = plan.single_pass_for_region(region) =>
-            {
+            EdgeTransfer::Break(region) if plan.single_pass_for_region(region).is_some() => {
+                let (_, fence) = plan
+                    .single_pass_for_region(region)
+                    .ok_or_else(|| StructureError::invalid("single-pass break owner is missing"))?;
                 let source = plan.region_for_block(edge.from).ok_or_else(|| {
                     StructureError::invalid(format!("edge #{index} source has no region"))
                 })?;

@@ -20,7 +20,7 @@ pub(super) fn is_truthy(value: &AbstractValue) -> bool {
     !matches!(value, AbstractValue::Nil | AbstractValue::False)
 }
 
-fn structural_expr_cost(expr: &HirExpr) -> usize {
+pub(super) fn structural_expr_cost(expr: &HirExpr) -> usize {
     match expr {
         HirExpr::Unary(unary) => 1 + structural_expr_cost(&unary.expr),
         HirExpr::Binary(binary) => {

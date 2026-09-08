@@ -194,11 +194,15 @@ pub(super) fn stabilize_table_constructors_in_proto(
         next_local_index: first_new_local,
         is_single_pass_root: false,
     };
+    // The atomic proof keeps global capture protection. Its once-only traversal
+    // must not enable the generic pass's root-only capture-site policy in branches.
+    let literal_changed = !has_unstructured_control
+        && literal_transaction::rebuild_single_pass_literals(&pass, &mut proto.body);
     let nested_changed = rewrite_stmts(&mut proto.body.stmts, &mut pass);
     // 根级语句没有回跳时只执行一次；后续捕获不能倒过来保护已经退役的旧 SSA 值。
     // 嵌套块仍使用全局保护，避免把循环上一轮建立的 capture 当作尚未发生。
     pass.is_single_pass_root = !has_unstructured_control;
-    let changed = pass.rewrite_block(&mut proto.body) || nested_changed;
+    let changed = pass.rewrite_block(&mut proto.body) || nested_changed || literal_changed;
     proto
         .local_debug_hints
         .extend((first_new_local..pass.next_local_index).map(|_| None));
@@ -226,7 +230,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
             return false;
         }
 
-        let mut changed = literal_transaction::rebuild_literal_transactions(self, block);
+        let mut changed = literal_transaction::rebuild_root_literals(self, block);
         changed |= retired_open::rebuild_retired_prefixes(self, block);
         // 先完成会压缩语句的原子退役，再建立同一坐标系下的 capture/occurrence 索引。
         let root_capture_sites = self
@@ -293,7 +297,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // suffix write. A new hash slot can rehash even a non-nil array, changing
                     // the length observed after later deletions.
                     if self.dialect == DecompileDialect::Lua51
-                        && seed_ctor.fields.iter().any(|field| matches!(field, HirTableField::Array(_)))
+                        && seed_ctor.fields.iter().any(|field| match field {
+                            HirTableField::Array(_) => true,
+                            HirTableField::Record(record) => {
+                                matches!(record.key, HirTableKey::Expr(HirExpr::Integer(_)))
+                            }
+                        })
                         && seed_ctor.trailing_multivalue.is_none()
                         && rebuilt_constructor.trailing_multivalue.is_none()
                         && literal_allocation(&seed_ctor) != literal_allocation(rebuilt_constructor)

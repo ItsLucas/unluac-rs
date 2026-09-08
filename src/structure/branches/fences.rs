@@ -89,6 +89,23 @@ pub(super) fn refine_single_pass_fences(
         if tails.next().is_some() {
             continue;
         }
+        // Zero-iteration and exhaustion edges share a for-loop's normal tail,
+        // not a cross-branch fence. Splitting here would cut the loop owner.
+        if loop_candidates.iter().any(|owner| {
+            matches!(
+                owner.kind_hint,
+                LoopKindHint::NumericForLike | LoopKindHint::GenericForLike
+            ) && owner.exits.contains(&tail)
+                && cfg.preds[tail.index()].iter().all(|edge| {
+                    let edge = cfg.edges[edge.index()];
+                    !cfg.reachable_blocks.contains(&edge.from)
+                        || edge.kind == EdgeKind::LoopExit
+                            && (owner.preheader == Some(edge.from)
+                                || owner.continue_target == Some(edge.from))
+                })
+        }) {
+            continue;
+        }
         // loop header 也可能是外层迭代的合法 single-pass continuation，但此时 fence
         // 必须完整位于该 natural loop 内。否则这里只是循环前的普通 branch 汇入
         // header，真实 backedge 会被误收为 early escape，并把 branch merge 提前。
@@ -179,8 +196,20 @@ pub(super) fn refine_single_pass_fences(
         }
 
         for nested in &branches_by_exit[exit.index()] {
-            if graph_facts.dominates(header, branch_candidates[*nested].header) {
-                branch_candidates[*nested].merge = Some(tail);
+            let candidate = &mut branch_candidates[*nested];
+            if graph_facts.dominates(header, candidate.header) {
+                // Moving the continuation onto an old arm turns the opposite arm
+                // into the body (possibly a fence escape), not an empty if/else.
+                if candidate.then_entry == tail {
+                    candidate.then_entry = candidate.else_entry.unwrap_or(exit);
+                    candidate.else_entry = None;
+                    candidate.invert_hint = !candidate.invert_hint;
+                    candidate.kind = BranchKind::IfThen;
+                } else if candidate.else_entry == Some(tail) {
+                    candidate.else_entry = None;
+                    candidate.kind = BranchKind::IfThen;
+                }
+                candidate.merge = Some(tail);
             }
         }
         fences.insert(header, SinglePassFenceFact { exit, escape_edges });

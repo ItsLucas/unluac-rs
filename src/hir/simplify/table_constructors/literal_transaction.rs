@@ -34,17 +34,48 @@ enum Value {
     Constant(HirExpr),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum RecordKey {
+    Name(String),
+    Integer(i64),
+}
+
+impl RecordKey {
+    fn from_expr(expr: &HirExpr) -> Option<Self> {
+        let key = table_key_from_expr(expr, DecompileDialect::Lua51);
+        if let HirTableKey::Name(name) = key {
+            return Some(Self::Name(name));
+        }
+        let integer = super::builder::statically_known_numeric_key(&key).flatten()?;
+        (-(1_i64 << 53)..=(1_i64 << 53))
+            .contains(&integer)
+            .then_some(Self::Integer(integer))
+    }
+
+    fn in_list(&self, length: usize) -> bool {
+        matches!(self, Self::Integer(index)
+            if usize::try_from(*index).is_ok_and(|index| index > 0 && index <= length))
+    }
+
+    fn to_hir(&self) -> HirTableKey {
+        match self {
+            Self::Name(name) => HirTableKey::Name(name.clone()),
+            Self::Integer(index) => HirTableKey::Expr(HirExpr::Integer(*index)),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum Event {
     Write(TempId),
     NewTable(TempId, Lua51TableAllocation),
-    Record(TempId, String, Value),
+    Record(TempId, RecordKey, Value),
     List(TempId, u32, Vec<TempId>),
 }
 
 struct Field {
     order: usize,
-    name: Option<String>,
+    key: Option<RecordKey>,
     value: Value,
 }
 
@@ -70,14 +101,67 @@ struct Transaction {
     events: Vec<Event>,
 }
 
-pub(super) fn rebuild_literal_transactions(
+pub(super) fn rebuild_single_pass_literals(
     pass: &TableConstructorPass<'_>,
     block: &mut HirBlock,
 ) -> bool {
+    if pass.dialect != DecompileDialect::Lua51 || pass.promotion_facts.compacts_home_slots() {
+        return false;
+    }
+    let mut global_uses = LastUses::default();
+    visit_stmts(&block.stmts, &mut global_uses);
+    rewrite_once_only_blocks(block, &mut |block| {
+        rebuild_literal_transactions(pass, block, &global_uses.counts)
+    })
+}
+
+pub(super) fn rebuild_root_literals(
+    pass: &TableConstructorPass<'_>,
+    block: &mut HirBlock,
+) -> bool {
+    if !pass.is_single_pass_root {
+        return false;
+    }
+    let mut global_uses = LastUses::default();
+    visit_stmts(&block.stmts, &mut global_uses);
+    rebuild_literal_transactions(pass, block, &global_uses.counts)
+}
+
+fn rewrite_once_only_blocks(
+    block: &mut HirBlock,
+    rewrite: &mut impl FnMut(&mut HirBlock) -> bool,
+) -> bool {
+    let mut changed = rewrite(block);
+    for stmt in &mut block.stmts {
+        match stmt {
+            HirStmt::If(branch) => {
+                changed |= rewrite_once_only_blocks(&mut branch.then_block, rewrite);
+                if let Some(block) = &mut branch.else_block {
+                    changed |= rewrite_once_only_blocks(block, rewrite);
+                }
+            }
+            HirStmt::Block(block) => {
+                changed |= rewrite_once_only_blocks(block, rewrite);
+            }
+            // In particular, never enter any kind of loop or its nested conditionals.
+            _ => {}
+        }
+    }
+    changed
+}
+
+fn rebuild_literal_transactions(
+    pass: &TableConstructorPass<'_>,
+    block: &mut HirBlock,
+    global_uses: &BTreeMap<TempId, usize>,
+) -> bool {
     if pass.dialect != DecompileDialect::Lua51
-        || !pass.is_single_pass_root
         || pass.promotion_facts.compacts_home_slots()
         || block.stmts.len() > MAX_GENERIC_SET_LIST_SCAN_STMTS
+        || !block
+            .stmts
+            .iter()
+            .any(|stmt| super::scan::constructor_seed(stmt).is_some())
     {
         return false;
     }
@@ -86,6 +170,7 @@ pub(super) fn rebuild_literal_transactions(
         uses.index = index;
         visit_stmts(std::slice::from_ref(stmt), &mut uses);
     }
+    uses.protect_external_uses(global_uses);
     // Keep original coordinates for suffix-use checks while committing disjoint regions.
     let mut removed = 0;
     let mut index = 0;
@@ -109,6 +194,18 @@ struct LastUses {
     index: usize,
     last: BTreeMap<TempId, usize>,
     last_list: BTreeMap<TempId, usize>,
+    counts: BTreeMap<TempId, usize>,
+    external: BTreeSet<TempId>,
+}
+
+impl LastUses {
+    fn protect_external_uses(&mut self, global: &BTreeMap<TempId, usize>) {
+        self.external = self
+            .counts
+            .iter()
+            .filter_map(|(temp, count)| (global.get(temp) != Some(count)).then_some(*temp))
+            .collect();
+    }
 }
 
 impl HirVisitor for LastUses {
@@ -123,6 +220,7 @@ impl HirVisitor for LastUses {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             self.last.insert(*temp, self.index);
+            *self.counts.entry(*temp).or_default() += 1;
         }
     }
 }
@@ -152,7 +250,7 @@ fn literal_transaction(
             && uses
                 .last_list
                 .get(&root)
-                .is_some_and(|last| *last <= index + removed)
+                .is_none_or(|last| *last <= index + removed)
             && transaction.allocation(root) == Some(allocation)
         {
             let Some(constructor) = complete_transaction(
@@ -199,6 +297,7 @@ fn extend_transaction(
                 let facts = pass.promotion_facts;
                 let home = facts.trusted_temp_home_slot(*temp)?;
                 if pass.materialized_bindings.get(binding) != Some(&1)
+                    || facts.is_repeat_condition_prefix_temp(*temp)
                     || pass.reference_captured_home_slots.contains(&home)
                     || pass.reference_captured_bindings.get(binding) == Some(&true)
                     || *temp != root && pass.debug_identity_bindings.get(binding) == Some(&true)
@@ -252,9 +351,7 @@ fn extend_transaction(
             let HirExpr::TempRef(owner) = access.base else {
                 return None;
             };
-            let HirTableKey::Name(name) = table_key_from_expr(&access.key, pass.dialect) else {
-                return None;
-            };
+            let key = RecordKey::from_expr(&access.key)?;
             if assign.values.tail.is_some() {
                 return None;
             }
@@ -274,19 +371,23 @@ fn extend_transaction(
                 }
                 _ => return None,
             };
+            let Contents::Table { list_count, .. } = transaction.producers.get(&owner)?.contents
+            else {
+                return None;
+            };
+            if key.in_list(list_count) {
+                return None;
+            }
             let fields = transaction.fields(owner)?;
-            if fields
-                .iter()
-                .any(|field| field.name.as_ref() == Some(&name))
-            {
+            if fields.iter().any(|field| field.key.as_ref() == Some(&key)) {
                 return None;
             }
             fields.push(Field {
                 order,
-                name: Some(name.clone()),
+                key: Some(key.clone()),
                 value: value.clone(),
             });
-            transaction.events.push(Event::Record(owner, name, value));
+            transaction.events.push(Event::Record(owner, key, value));
             root_write = owner == root;
         }
         HirStmt::TableSetList(batch) => {
@@ -305,6 +406,14 @@ fn extend_transaction(
             {
                 return None;
             }
+            if transaction.fields(owner)?.iter().any(|field| {
+                field
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.in_list(list_count + batch.values.fixed.len()))
+            }) {
+                return None;
+            }
             let mut values = Vec::new();
             for value in &batch.values.fixed {
                 let HirExpr::TempRef(temp) = value else {
@@ -317,7 +426,7 @@ fn extend_transaction(
                 }
                 transaction.fields(owner)?.push(Field {
                     order,
-                    name: None,
+                    key: None,
                     value: Value::Producer(*temp),
                 });
                 values.push(*temp);
@@ -347,10 +456,11 @@ fn complete_transaction(
     previous_event_count: Option<usize>,
 ) -> Option<HirTableConstructor> {
     if transaction.consumed.len() + 1 != transaction.producers.len()
-        || transaction
-            .producers
-            .keys()
-            .any(|temp| *temp != root && uses.last.get(temp).is_some_and(|last| *last > end))
+        || transaction.producers.keys().any(|temp| {
+            *temp != root
+                && (uses.external.contains(temp)
+                    || uses.last.get(temp).is_some_and(|last| *last > end))
+        })
     {
         return None;
     }
@@ -412,7 +522,7 @@ impl Transaction {
         let Contents::Table { fields, .. } = &self.producers.get(&temp)?.contents else {
             return None;
         };
-        let records = fields.iter().filter(|field| field.name.is_some()).count();
+        let records = fields.iter().filter(|field| field.key.is_some()).count();
         Some(Lua51TableAllocation::from_field_counts(
             fields.len() - records,
             records,
@@ -463,14 +573,14 @@ impl Transaction {
                 )?,
                 Value::Constant(value) => value.clone(),
             };
-            if let Some(name) = &field.name {
+            if let Some(key) = &field.key {
                 constructor
                     .fields
                     .push(HirTableField::Record(HirRecordField {
-                        key: HirTableKey::Name(name.clone()),
+                        key: key.to_hir(),
                         value,
                     }));
-                events.push(Event::Record(temp, name.clone(), field.value.clone()));
+                events.push(Event::Record(temp, key.clone(), field.value.clone()));
             } else {
                 let Value::Producer(child) = field.value else {
                     return None;
@@ -504,6 +614,78 @@ fn scalar(value: &HirExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir::common::{HirGenericFor, HirIf, HirNumericFor, HirRepeat, HirWhile, LocalId};
+
+    #[test]
+    fn once_only_walk_excludes_all_loop_bodies_and_their_conditionals() {
+        let branch = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: HirBlock {
+                stmts: vec![HirStmt::Block(Box::default())],
+            },
+            else_block: Some(HirBlock::default()),
+        }));
+        let loop_body = HirBlock {
+            stmts: vec![branch.clone()],
+        };
+        let mut root = HirBlock {
+            stmts: vec![
+                branch,
+                HirStmt::Block(Box::default()),
+                HirStmt::While(Box::new(HirWhile {
+                    cond: HirExpr::Boolean(true),
+                    body: loop_body.clone(),
+                })),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    cond: HirExpr::Boolean(false),
+                    body: loop_body.clone(),
+                })),
+                HirStmt::NumericFor(Box::new(HirNumericFor {
+                    binding: LocalId(0),
+                    start: HirExpr::Integer(1),
+                    limit: HirExpr::Integer(2),
+                    step: HirExpr::Integer(1),
+                    body: loop_body.clone(),
+                })),
+                HirStmt::GenericFor(Box::new(HirGenericFor {
+                    bindings: vec![LocalId(1)],
+                    iterator: Vec::new().into(),
+                    body: loop_body,
+                })),
+            ],
+        };
+        let mut visited = 0;
+        assert!(!rewrite_once_only_blocks(&mut root, &mut |_| {
+            visited += 1;
+            false
+        }));
+        assert_eq!(visited, 5);
+    }
+
+    #[test]
+    fn integer_record_keys_normalize_aliases_and_reject_unknown_keys() {
+        assert!(RecordKey::from_expr(&HirExpr::Number(1.0)) == Some(RecordKey::Integer(1)));
+        assert!(RecordKey::from_expr(&HirExpr::Integer(1)) == Some(RecordKey::Integer(1)));
+        assert!(RecordKey::from_expr(&HirExpr::Number(f64::NAN)).is_none());
+        assert!(RecordKey::from_expr(&HirExpr::Number(1.5)).is_none());
+        assert!(RecordKey::from_expr(&HirExpr::Integer(1_i64 << 54)).is_none());
+        assert!(RecordKey::from_expr(&HirExpr::TempRef(TempId(1))).is_none());
+        assert!(RecordKey::Integer(1).in_list(3));
+        assert!(!RecordKey::Integer(0).in_list(3));
+        assert!(!RecordKey::Integer(-1).in_list(3));
+        assert!(!RecordKey::Integer(4).in_list(3));
+    }
+
+    #[test]
+    fn descendant_producers_cannot_ignore_uses_outside_their_block() {
+        let mut local = LastUses {
+            counts: BTreeMap::from([(TempId(1), 1), (TempId(2), 2)]),
+            ..LastUses::default()
+        };
+        local.protect_external_uses(&BTreeMap::from([(TempId(1), 2), (TempId(2), 2)]));
+        assert!(local.external.contains(&TempId(1)));
+        assert!(!local.external.contains(&TempId(2)));
+    }
 
     fn table(home: usize, fields: Vec<(Option<&str>, usize)>) -> Producer {
         Producer {
@@ -514,7 +696,7 @@ mod tests {
                     .into_iter()
                     .map(|(name, temp)| Field {
                         order: 0,
-                        name: name.map(str::to_owned),
+                        key: name.map(|name| RecordKey::Name(name.to_owned())),
                         value: Value::Producer(TempId(temp)),
                     })
                     .collect(),
@@ -556,7 +738,11 @@ mod tests {
                     Event::NewTable(TempId(0), Lua51TableAllocation::from_field_counts(1, 1)),
                     Event::Write(TempId(1)),
                     Event::NewTable(TempId(2), Lua51TableAllocation::from_field_counts(0, 0)),
-                    Event::Record(TempId(0), "tag".to_owned(), Value::Producer(TempId(2))),
+                    Event::Record(
+                        TempId(0),
+                        RecordKey::Name("tag".to_owned()),
+                        Value::Producer(TempId(2))
+                    ),
                     Event::List(TempId(0), 1, vec![TempId(1)]),
                 ]
         );

@@ -271,29 +271,16 @@ pub(super) fn freeze_exit_copy_actions(
 
     let mut actions = FrozenExitActions::default();
     for (target, (zero_value, normal_value)) in by_target {
-        if break_targets.contains(&target) {
-            let (value, origins) = common_exit_value(
-                target,
-                zero_value,
-                normal_value,
-                "for early-break state has no common normal default",
-            )?;
-            match classify_copy_source(context, value, target, &origins)? {
-                Some(source) => actions.before_loop.push(LoopValueWrite {
-                    target,
-                    source,
-                    origins,
-                }),
-                None => actions.elided.extend(origins),
-            }
-            continue;
-        }
-
+        let has_break_write = break_targets.contains(&target);
         let reg = dataflow
             .phi_candidate(target)
             .ok_or_else(|| StructureError::invalid("for exit action targets a missing phi"))?
             .reg;
-        if let Some(header) = payload.header_values.iter().find(|value| value.reg == reg) {
+        if let Some(header) = payload
+            .header_values
+            .iter()
+            .find(|value| value.reg == reg && !has_break_write)
+        {
             let zero_matches = zero_value.as_ref().is_none_or(|(value, _)| {
                 header
                     .outside_arm
@@ -333,6 +320,8 @@ pub(super) fn freeze_exit_copy_actions(
             (zero_value.as_ref(), normal_value.as_ref())
             && zero != normal
         {
+            // A break performs its own edge copy and skips the iteration epilogue.
+            // Distinct zero/normal values must not overwrite that copy after the loop.
             if let Some(source) = classify_copy_source(context, *zero, target, zero_origins)? {
                 actions.before_loop.push(LoopValueWrite {
                     target,
@@ -361,11 +350,18 @@ pub(super) fn freeze_exit_copy_actions(
             "for exit actions have no common state identity",
         )?;
         match classify_copy_source(context, value, target, &origins)? {
-            Some(source) => actions.after_loop.push(LoopValueWrite {
-                target,
-                source,
-                origins,
-            }),
+            Some(source) => {
+                let writes = if has_break_write {
+                    &mut actions.before_loop
+                } else {
+                    &mut actions.after_loop
+                };
+                writes.push(LoopValueWrite {
+                    target,
+                    source,
+                    origins,
+                });
+            }
             None => actions.elided.extend(origins),
         }
     }

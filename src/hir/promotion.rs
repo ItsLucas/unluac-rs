@@ -131,7 +131,7 @@ fn analyze_slot_epoch(
                 .then_some(block)
         })
         .collect::<BTreeSet<_>>();
-    let merge_blocks = place_epoch_merges(cfg, graph, &close_blocks);
+    let merge_blocks = place_epoch_merges(proto, cfg, graph, reg, &close_blocks);
     let mut at_instr = vec![0; proto.instrs.len()];
     let mut stack = vec![0];
     let mut events = vec![EpochRenameEvent::Enter(cfg.entry_block)];
@@ -193,13 +193,16 @@ fn analyze_slot_epoch(
 }
 
 fn place_epoch_merges(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph: &GraphFacts,
+    reg: Reg,
     close_blocks: &BTreeSet<BlockRef>,
 ) -> BTreeSet<BlockRef> {
     // loop 内的 Close 会先在 header 的 dominance frontier 合成 epoch，但 header
     // 可能同时支配下一轮 body 和循环外 continuation。循环外物理槽已经越过 cleanup，
     // 因此真实 exit target 也必须显式开始一个 merge epoch，不能继续继承 header 身份。
+    let open_captures = open_capture_block_exits(proto, cfg, reg);
     let mut placed = graph
         .natural_loops
         .iter()
@@ -213,6 +216,13 @@ fn place_epoch_merges(
                     .then_some(target)
                 })
             })
+        })
+        .filter(|target| {
+            // A natural-loop exit can still be a lexical break arm before Close.
+            // Its writes must retain the open upvalue's identity.
+            cfg.preds[target.index()]
+                .iter()
+                .all(|edge| !open_captures[cfg.edges[edge.index()].from.index()])
         })
         .collect::<BTreeSet<_>>();
     let mut pending = close_blocks.iter().copied().collect::<VecDeque<_>>();
@@ -235,6 +245,48 @@ fn place_epoch_merges(
         placed.insert(cfg.entry_block);
     }
     placed
+}
+
+fn open_capture_block_exits(proto: &LoweredProto, cfg: &Cfg, reg: Reg) -> Vec<bool> {
+    let mut open = vec![false; cfg.blocks.len()];
+    let mut closes = vec![false; cfg.blocks.len()];
+    let mut pending = Vec::new();
+    for &block in &cfg.reachable_blocks {
+        let range = cfg.blocks[block.index()].instrs;
+        let state =
+            (range.start.index()..range.end())
+                .rev()
+                .find_map(|index| match &proto.instrs[index] {
+                    LowInstr::Close(close) if close.from.index() <= reg.index() => Some(false),
+                    LowInstr::Closure(closure)
+                        if closure
+                            .captures
+                            .iter()
+                            .any(|capture| capture.source == CaptureSource::ByReference(reg)) =>
+                    {
+                        Some(true)
+                    }
+                    _ => None,
+                });
+        match state {
+            Some(true) => {
+                open[block.index()] = true;
+                pending.push(block);
+            }
+            Some(false) => closes[block.index()] = true,
+            None => {}
+        }
+    }
+    while let Some(block) = pending.pop() {
+        for &edge in &cfg.succs[block.index()] {
+            let target = cfg.edges[edge.index()].to;
+            if !closes[target.index()] && !open[target.index()] {
+                open[target.index()] = true;
+                pending.push(target);
+            }
+        }
+    }
+    open
 }
 
 enum EpochRenameEvent {

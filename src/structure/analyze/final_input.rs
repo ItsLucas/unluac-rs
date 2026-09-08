@@ -24,6 +24,11 @@ pub(super) fn final_plan_input(
     caps: ControlFlowCaps,
 ) -> Result<FinalPlanInput, StructureError> {
     let branch_regions = unique_branch_regions(branch_regions)?;
+    let fence_headers_by_tail = branch_regions
+        .values()
+        .filter(|region| region.single_pass_fence.is_some())
+        .map(|region| (region.merge, region.header))
+        .collect::<BTreeMap<_, _>>();
     let branch_value_merges = unique_branch_value_merges(branch_value_merges)?;
     let (conditions, condition_by_header) = selected_conditions(ConditionSelectionInput {
         proto,
@@ -54,9 +59,14 @@ pub(super) fn final_plan_input(
             let frozen_region = branch_regions
                 .get(&branch.header)
                 .map(|region| (*region).clone());
-            let boundary_changed = frozen_region
-                .as_ref()
-                .is_none_or(|region| region.single_pass_fence.is_none())
+            // Nested guards share the fence's lexical tail even when a folded
+            // condition also exits directly to the continuation after the fence.
+            let fence_boundary = branch.merge.is_some_and(|tail| {
+                fence_headers_by_tail
+                    .get(&tail)
+                    .is_some_and(|header| graph_facts.dominates(*header, branch.header))
+            });
+            let boundary_changed = !fence_boundary
                 && normalize_branch_condition_boundary(
                     cfg,
                     graph_facts,
