@@ -19,10 +19,11 @@ use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
     GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
-    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr,
-    NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr,
-    SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError, UnaryOpInstr, UnaryOpKind,
-    UpvalueRef, ValueOperand, ValuePack, VarArgInstr, instantiate_closure_children,
+    LoadConstInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto, LoweringMap,
+    Lua51TableAllocation, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
+    ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TailCallInstr,
+    TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand, ValuePack, VarArgInstr,
+    instantiate_closure_children,
 };
 
 const BITRK: u16 = 1 << 8;
@@ -237,13 +238,19 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 Lua51Opcode::NewTable => {
-                    let (a, _, _) = expect_abc(raw_pc, opcode, operands)?;
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            lua51_allocation: Some(Lua51TableAllocation {
+                                array_hint: b,
+                                hash_hint: c,
+                            }),
+                        })),
                     );
                     raw_index += 1;
                 }

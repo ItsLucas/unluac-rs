@@ -686,6 +686,36 @@ impl TypeGuardKind {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct NewTableInstr {
     pub dst: Reg,
+    pub lua51_allocation: Option<Lua51TableAllocation>,
+}
+
+/// Original Lua 5.1 NEWTABLE B/C operands, not decoded capacities. Matching the
+/// compiler's floating-byte encoding avoids guessing where a full initializer ends.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct Lua51TableAllocation {
+    pub array_hint: u16,
+    pub hash_hint: u16,
+}
+
+impl Lua51TableAllocation {
+    pub(crate) fn from_field_counts(array: usize, records: usize) -> Self {
+        fn int_to_fb(mut count: usize) -> u16 {
+            let mut exponent = 0;
+            while count >= 16 {
+                count = count.div_ceil(2);
+                exponent += 1;
+            }
+            if count < 8 {
+                count as u16
+            } else {
+                ((exponent + 1) << 3) | (count as u16 - 8)
+            }
+        }
+        Self {
+            array_hint: int_to_fb(array),
+            hash_hint: int_to_fb(records),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -845,4 +875,38 @@ pub struct BranchInstr {
     pub cond: BranchCond,
     pub then_target: InstrRef,
     pub else_target: InstrRef,
+}
+
+#[cfg(test)]
+mod literal_allocation_tests {
+    use super::Lua51TableAllocation;
+
+    #[test]
+    fn lua51_floating_byte_hints_match_compiler_rounding() {
+        for (count, encoded) in [
+            (0, 0),
+            (7, 7),
+            (8, 8),
+            (15, 15),
+            (16, 16),
+            (17, 17),
+            (18, 17),
+            (31, 24),
+            (32, 24),
+            (33, 25),
+            (50, 29),
+            (52, 29),
+            (100, 37),
+            (127, 40),
+            (128, 40),
+        ] {
+            assert_eq!(
+                Lua51TableAllocation::from_field_counts(count, count),
+                Lua51TableAllocation {
+                    array_hint: encoded,
+                    hash_hint: encoded
+                },
+            );
+        }
+    }
 }

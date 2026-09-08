@@ -312,7 +312,10 @@ impl<'a> ProtoLowerer<'a> {
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            lua51_allocation: None,
+                        })),
                     );
                     raw_index += 1;
                 }
@@ -323,7 +326,10 @@ impl<'a> ProtoLowerer<'a> {
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            lua51_allocation: None,
+                        })),
                     );
                     self.emit_dup_table_template(raw_pc, raw_index, dst, d as usize)?;
                     raw_index += 1;

@@ -342,6 +342,7 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst: reg_from_u8(a),
+                            lua51_allocation: None,
                         })),
                     );
                     raw_index += 1;
@@ -354,7 +355,10 @@ impl<'a> ProtoLowerer<'a> {
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            lua51_allocation: None,
+                        })),
                     );
                     for (index, literal) in table.array.iter().enumerate() {
                         if matches!(literal.value, RawLiteralConst::Nil) {

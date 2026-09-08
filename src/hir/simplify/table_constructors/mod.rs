@@ -18,10 +18,12 @@
 //! 代替物理槽写入、完整数组布局与后续 GC/长度观察的证明。
 //! 同块 seed 从内向外恢复，避免 locals 在父构造器看到已完成子项之前合并 SSA 身份。
 //! 单定义标量 temp 只进入完整 literal；嵌套分配要求根级 primitive/入口 nil 旧槽，不预填 nil。
+//! Whole raw literal transactions additionally replay physical scratch writes atomically.
 
 mod bindings;
 mod builder;
 mod inline_value;
+mod literal_transaction;
 mod raw_producers;
 mod rebuild;
 mod retired_open;
@@ -36,6 +38,7 @@ use crate::hir::common::{
     HirTableField, HirTableKey, HirValuePack, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::transformer::Lua51TableAllocation;
 
 use self::bindings::{
     BindingFacts, BindingIndex, BindingOccurrenceIndex, BindingSlots, StmtBindingSummary,
@@ -223,7 +226,8 @@ impl HirRewritePass for TableConstructorPass<'_> {
             return false;
         }
 
-        let mut changed = retired_open::rebuild_retired_prefixes(self, block);
+        let mut changed = literal_transaction::rebuild_literal_transactions(self, block);
+        changed |= retired_open::rebuild_retired_prefixes(self, block);
         // 先完成会压缩语句的原子退役，再建立同一坐标系下的 capture/occurrence 索引。
         let root_capture_sites = self
             .is_single_pass_root
@@ -285,6 +289,17 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     &mut scratch,
                 );
                 candidate.filter(|(rebuilt_constructor, end_index)| {
+                    // Do not undo a completed literal transaction by absorbing an explicit
+                    // suffix write. A new hash slot can rehash even a non-nil array, changing
+                    // the length observed after later deletions.
+                    if self.dialect == DecompileDialect::Lua51
+                        && seed_ctor.fields.iter().any(|field| matches!(field, HirTableField::Array(_)))
+                        && seed_ctor.trailing_multivalue.is_none()
+                        && rebuilt_constructor.trailing_multivalue.is_none()
+                        && literal_allocation(&seed_ctor) != literal_allocation(rebuilt_constructor)
+                    {
+                        return false;
+                    }
                     let has_temp_producers = block.stmts[index + 1..=*end_index]
                         .iter()
                         .any(|stmt| matches!(stmt, HirStmt::Assign(assign)
@@ -347,7 +362,27 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             rebuilt_constructor,
                             &safe_overwrites,
                         );
-                    !invalid_array_shape
+                    // A complete first SETLIST batch on a canonical raw seed carries the
+                    // VM's array layout, including all-nil runs. The generic nil guard is
+                    // for extending existing tables; here every removed write is separately
+                    // proved to overwrite a primitive/entry-nil slot. Exclude record writes,
+                    // open packs and additional batches from this narrow exception.
+                    let complete_literal_batch = seed_ctor.fields.is_empty()
+                        && seed_ctor.trailing_multivalue.is_none()
+                        && self.literal_constructor_overwrites_are_safe(
+                            block, index, *end_index, binding, rebuilt_constructor,
+                            &safe_overwrites,
+                        )
+                        && matches!(&block.stmts[*end_index], HirStmt::TableSetList(batch)
+                            if batch.start_index == 1
+                                && batch.values.tail.is_none()
+                                && batch.values.fixed.len() <= 50
+                                && batch.values.fixed.len() == rebuilt_constructor.fields.len())
+                        && block.stmts[index + 1..*end_index].iter().all(|stmt| {
+                            matches!(stmt, HirStmt::Assign(assign)
+                                if assign.targets.iter().all(|target| matches!(target, HirLValue::Temp(_))))
+                        });
+                    (!invalid_array_shape || complete_literal_batch)
                         && !producer_root_is_observable
                         && (open_local_owner || !has_followup_object_write)
                         && overwrite_timing_is_safe
@@ -383,6 +418,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
         changed |= self.materialize_safe_fixed_set_lists(block);
         changed
     }
+}
+
+fn literal_allocation(constructor: &HirTableConstructor) -> Lua51TableAllocation {
+    let array_fields = constructor.fields.iter()
+        .filter(|field| matches!(field, HirTableField::Array(_))).count();
+    Lua51TableAllocation::from_field_counts(array_fields, constructor.fields.len() - array_fields)
 }
 
 fn region_has_non_drop_safe_producer(
@@ -466,6 +507,8 @@ impl TableConstructorPass<'_> {
         self.is_single_pass_root
             && self.can_rebuild_primitive_temp_region(binding)
             && safe_overwrites.contains(&temp)
+            && self.promotion_facts.lua51_table_allocation(temp)
+                == Some(literal_allocation(constructor))
             && constructor.fields.iter().all(|field| match field {
                 HirTableField::Array(value) => expr_is_literal_tree(value),
                 HirTableField::Record(record) => {

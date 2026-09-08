@@ -1,0 +1,94 @@
+//! Allocation-aware boundaries at full Lua 5.1 SETLIST batches.
+use super::*;
+
+const fn debug(entry: LuaCaseMatrixEntry) -> LuaCaseMatrixEntry {
+    entry
+        .with_variants(&[LuaCaseVariant::NamingDebugLike])
+        .with_options(LuaCaseOptions {
+            retain_debug: true,
+            ..LuaCaseOptions::DEFAULT
+        })
+}
+
+pub(super) const REGRESSION_CASES_358_367: &[LuaCaseMatrixEntry] = &[
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_358_tail_record_50.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_358_tail_record_50.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_359_post_record_50.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_359_post_record_50.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_360_tail_record_100.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_360_tail_record_100.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_361_post_record_100.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_361_post_record_100.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_362_tail_nested_50.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_362_tail_nested_50.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_363_post_nested_50.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_363_post_nested_50.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_364_tail_nested_100.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_364_tail_nested_100.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_365_post_nested_100.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_365_post_nested_100.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_366_post_dense_50.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_366_post_dense_50.lua",
+        PUC_LUA_51,
+    )),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_367_post_dense_100.lua",
+        PUC_LUA_51,
+    ),
+    debug(LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_367_post_dense_100.lua",
+        PUC_LUA_51,
+    )),
+];

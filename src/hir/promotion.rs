@@ -26,8 +26,10 @@ use crate::structure::{
     LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SsaValue,
     StructurePlan,
 };
-use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
-use std::collections::{BTreeSet, VecDeque};
+use crate::transformer::{
+    CaptureSource, InstrRef, LowInstr, LoweredProto, Lua51TableAllocation, Reg,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
 ///
@@ -265,6 +267,10 @@ enum HomeSlotResolution {
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<Option<HomeSlotKey>>,
+    raw_literal_trace: Vec<RawLiteralInstruction>,
+    raw_literal_starts: Vec<Option<usize>>,
+    raw_literal_successor_writes: BTreeMap<usize, BTreeSet<HomeSlotKey>>,
+    raw_primitive_overwrite_temps: BTreeSet<TempId>,
     immediate_move_write_homes: Vec<BTreeSet<HomeSlotKey>>,
     entry_nil_overwrite_temps: BTreeSet<TempId>,
     entry_nil_phi_temps: BTreeSet<TempId>,
@@ -278,6 +284,17 @@ pub(super) struct ProtoPromotionFacts {
     invalidated_local_homes: BTreeSet<LocalId>,
     invalidated_temp_homes: BTreeSet<TempId>,
     compact_home_slots: bool,
+}
+
+/// Physical instructions retained independently of HIR expression folding. LOADNIL
+/// ranges expand to individual writes; even an elided MOVE is a barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RawLiteralInstruction {
+    Write(TempId),
+    NewTable(TempId, Lua51TableAllocation),
+    Record,
+    SetList,
+    Barrier,
 }
 
 impl ProtoPromotionFacts {
@@ -303,9 +320,23 @@ impl ProtoPromotionFacts {
             phi_temps,
             total_temps,
         );
+        let mut raw_literal_successor_writes = BTreeMap::new();
+        let (raw_literal_trace, raw_literal_starts, raw_primitive_overwrite_temps) =
+            collect_raw_literal_trace(
+                proto,
+                dataflow,
+                fixed_temps,
+                total_temps,
+                &temp_home_slots,
+                &mut raw_literal_successor_writes,
+            );
 
         Self {
             temp_home_slots,
+            raw_literal_trace,
+            raw_literal_starts,
+            raw_literal_successor_writes,
+            raw_primitive_overwrite_temps,
             immediate_move_write_homes,
             entry_nil_overwrite_temps: collect_entry_nil_overwrite_temps(
                 proto,
@@ -332,6 +363,61 @@ impl ProtoPromotionFacts {
 
     pub(super) fn is_direct_table_seed_temp(&self, temp: TempId) -> bool {
         self.direct_table_seed_temps.contains(&temp)
+    }
+
+    pub(super) fn raw_literal_trace_matches(&self, trace: &[RawLiteralInstruction]) -> bool {
+        let Some(RawLiteralInstruction::Write(first) | RawLiteralInstruction::NewTable(first, _)) =
+            trace.first()
+        else {
+            return false;
+        };
+        let Some(start) = self
+            .raw_literal_starts
+            .get(first.index())
+            .copied()
+            .flatten()
+        else {
+            return false;
+        };
+        self.raw_literal_trace.get(start..start + trace.len()) == Some(trace)
+    }
+
+    pub(super) fn lua51_table_allocation(&self, temp: TempId) -> Option<Lua51TableAllocation> {
+        let start = self
+            .raw_literal_starts
+            .get(temp.index())
+            .copied()
+            .flatten()?;
+        match self.raw_literal_trace.get(start)? {
+            RawLiteralInstruction::NewTable(owner, allocation) if *owner == temp => {
+                Some(*allocation)
+            }
+            _ => None,
+        }
+    }
+
+    /// A longer rounded-hint prefix must not consume a named suffix local that
+    /// stays rooted across later calls. Require an immediate physical overwrite
+    /// of its surviving table homes, independently of stripped debug metadata.
+    pub(super) fn raw_literal_successor_overwrites(
+        &self,
+        root: TempId,
+        trace_len: usize,
+        homes: &BTreeSet<HomeSlotKey>,
+    ) -> bool {
+        if homes.is_empty() {
+            return true;
+        }
+        let Some(start) = self.raw_literal_starts.get(root.index()).copied().flatten() else {
+            return false;
+        };
+        self.raw_literal_successor_writes
+            .get(&(start + trace_len))
+            .is_some_and(|writes| homes.is_subset(writes))
+    }
+
+    pub(super) fn overwrites_raw_primitive(&self, temp: TempId) -> bool {
+        self.raw_primitive_overwrite_temps.contains(&temp)
     }
 
     /// 该 temp 是非参数槽的首个 canonical fixed def；槽在函数入口因此必为 nil。
@@ -866,6 +952,108 @@ fn collect_immediate_move_write_homes(
     homes
 }
 
+fn collect_raw_literal_trace(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    temp_count: usize,
+    temp_home_slots: &[Option<HomeSlotKey>],
+    successor_writes: &mut BTreeMap<usize, BTreeSet<HomeSlotKey>>,
+) -> (
+    Vec<RawLiteralInstruction>,
+    Vec<Option<usize>>,
+    BTreeSet<TempId>,
+) {
+    let mut trace = Vec::new();
+    let mut starts = vec![None; temp_count];
+    let mut primitive_regs = std::collections::BTreeMap::new();
+    let mut primitive_overwrites = BTreeSet::new();
+    for (index, instr) in proto.instrs.iter().enumerate() {
+        match instr {
+            LowInstr::NewTable(_)
+            | LowInstr::LoadNil(_)
+            | LowInstr::LoadBool(_)
+            | LowInstr::LoadConst(_)
+            | LowInstr::LoadInteger(_)
+            | LowInstr::LoadNumber(_) => {
+                if dataflow.instr_defs[index].is_empty() {
+                    primitive_regs.clear();
+                    trace.push(RawLiteralInstruction::Barrier);
+                }
+                for def in &dataflow.instr_defs[index] {
+                    let temp = TempId(def.index());
+                    let definition = &dataflow.defs[def.index()];
+                    if fixed_temps.get(def.index()) == Some(&temp) {
+                        // A linear predecessor in another block need not execute on
+                        // every path to this write (for example the end of an `if`).
+                        if primitive_regs.get(&definition.reg) == Some(&definition.block) {
+                            primitive_overwrites.insert(temp);
+                        }
+                        starts[temp.index()] = Some(trace.len());
+                        trace.push(match instr {
+                            LowInstr::NewTable(table) => table
+                                .lua51_allocation
+                                .map_or(RawLiteralInstruction::Barrier, |allocation| {
+                                    RawLiteralInstruction::NewTable(temp, allocation)
+                                }),
+                            _ => RawLiteralInstruction::Write(temp),
+                        });
+                    } else {
+                        trace.push(RawLiteralInstruction::Barrier);
+                    }
+                    let reg = definition.reg;
+                    if matches!(instr, LowInstr::NewTable(_)) {
+                        primitive_regs.remove(&reg);
+                    } else {
+                        primitive_regs.insert(reg, definition.block);
+                    }
+                }
+            }
+            LowInstr::SetTable(_) => {
+                primitive_regs.clear();
+                trace.push(RawLiteralInstruction::Record);
+            }
+            LowInstr::SetList(_) => trace.push(RawLiteralInstruction::SetList),
+            _ => {
+                // Include writes hidden by HIR folding: a MOVE, call or control
+                // boundary must invalidate old primitive-slot evidence.
+                primitive_regs.clear();
+                trace.push(RawLiteralInstruction::Barrier);
+            }
+        }
+        if matches!(instr, LowInstr::SetTable(_) | LowInstr::SetList(_))
+            && proto
+                .instrs
+                .get(index + 1)
+                .is_some_and(is_literal_successor_write)
+            && let Some(defs) = dataflow.instr_defs.get(index + 1)
+        {
+            successor_writes.insert(
+                trace.len(),
+                defs.iter()
+                    .filter_map(|def| temp_home_slots.get(def.index()).copied().flatten())
+                    .collect(),
+            );
+        }
+    }
+    (trace, starts, primitive_overwrites)
+}
+
+fn is_literal_successor_write(instr: &LowInstr) -> bool {
+    match instr {
+        LowInstr::LoadNil(_)
+        | LowInstr::LoadBool(_)
+        | LowInstr::LoadConst(_)
+        | LowInstr::LoadInteger(_)
+        | LowInstr::LoadNumber(_)
+        | LowInstr::NewTable(_) => true,
+        // No producer has escaped the private literal, so a global cannot return
+        // the added child. An arbitrary read or MOVE could merely copy it back.
+        LowInstr::GetTable(read) => matches!(read.base, crate::transformer::AccessBase::Env),
+        _ => false,
+    }
+}
+
 fn collect_entry_nil_overwrite_temps(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
@@ -1120,5 +1308,134 @@ fn merge_home_slot_resolutions(
         (HomeSlotResolution::Known(_), HomeSlotResolution::Known(_)) => {
             HomeSlotResolution::Conflict
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_literal_trace_tests {
+    use super::{HomeSlotKey, ProtoPromotionFacts, RawLiteralInstruction as Op};
+    use crate::hir::common::TempId;
+    use crate::transformer::Lua51TableAllocation;
+
+    fn facts(trace: Vec<Op>) -> ProtoPromotionFacts {
+        let mut starts = vec![None; 3];
+        for (index, op) in trace.iter().enumerate() {
+            if let Op::Write(temp) | Op::NewTable(temp, _) = op {
+                starts[temp.index()] = Some(index);
+            }
+        }
+        ProtoPromotionFacts {
+            raw_literal_trace: trace,
+            raw_literal_starts: starts,
+            ..ProtoPromotionFacts::default()
+        }
+    }
+
+    #[test]
+    fn complete_literal_trace_keeps_records_and_flushes() {
+        let trace = vec![
+            Op::Write(TempId(0)),
+            Op::Write(TempId(1)),
+            Op::Record,
+            Op::SetList,
+        ];
+        assert!(facts(trace.clone()).raw_literal_trace_matches(&trace));
+    }
+
+    #[test]
+    fn hidden_scratch_write_before_final_flush_is_not_ignored() {
+        let facts = facts(vec![
+            Op::Write(TempId(0)),
+            Op::Write(TempId(1)),
+            Op::Write(TempId(2)),
+            Op::SetList,
+        ]);
+        assert!(!facts.raw_literal_trace_matches(&[
+            Op::Write(TempId(0)),
+            Op::Write(TempId(1)),
+            Op::SetList,
+        ]));
+    }
+
+    #[test]
+    fn elided_move_or_call_barrier_is_not_a_literal_instruction() {
+        let facts = facts(vec![
+            Op::Write(TempId(0)),
+            Op::Barrier,
+            Op::Write(TempId(1)),
+            Op::SetList,
+        ]);
+        assert!(!facts.raw_literal_trace_matches(&[
+            Op::Write(TempId(0)),
+            Op::Write(TempId(1)),
+            Op::SetList,
+        ]));
+    }
+
+    #[test]
+    fn trailing_constructor_record_requires_the_original_hash_reservation() {
+        let allocation = Lua51TableAllocation::from_field_counts(50, 1);
+        let trace = vec![
+            Op::NewTable(TempId(0), allocation),
+            Op::Write(TempId(1)),
+            Op::SetList,
+            Op::Record,
+        ];
+        let facts = facts(trace.clone());
+        assert!(facts.raw_literal_trace_matches(&trace));
+        assert!(!facts.raw_literal_trace_matches(&[
+            Op::NewTable(TempId(0), Lua51TableAllocation::from_field_counts(50, 0)),
+            Op::Write(TempId(1)),
+            Op::SetList,
+        ]));
+    }
+
+    #[test]
+    fn identical_suffix_record_without_hash_reservation_is_not_an_initializer() {
+        let allocation = Lua51TableAllocation::from_field_counts(100, 0);
+        let trace = vec![
+            Op::NewTable(TempId(0), allocation),
+            Op::Write(TempId(1)),
+            Op::SetList,
+            Op::Record,
+        ];
+        let facts = facts(trace.clone());
+        assert!(facts.raw_literal_trace_matches(&trace[..3]));
+        assert!(!facts.raw_literal_trace_matches(&[
+            Op::NewTable(TempId(0), Lua51TableAllocation::from_field_counts(100, 1)),
+            Op::Write(TempId(1)),
+            Op::SetList,
+            Op::Record,
+        ]));
+    }
+
+    #[test]
+    fn rounded_extension_requires_overwriting_every_added_table_home() {
+        let trace = vec![
+            Op::NewTable(TempId(0), Lua51TableAllocation::from_field_counts(50, 17)),
+            Op::Record,
+        ];
+        let mut facts = facts(trace);
+        let child = HomeSlotKey::new(1, 0);
+        let next_local = HomeSlotKey::new(2, 0);
+        let homes = std::collections::BTreeSet::from([child]);
+        facts
+            .raw_literal_successor_writes
+            .insert(2, [next_local].into());
+        assert!(!facts.raw_literal_successor_overwrites(TempId(0), 2, &homes));
+        facts.raw_literal_successor_writes.insert(2, [child].into());
+        assert!(facts.raw_literal_successor_overwrites(TempId(0), 2, &homes));
+        assert!(
+            !facts.raw_literal_successor_overwrites(TempId(0), 2, &[child, next_local].into(),)
+        );
+    }
+
+    #[test]
+    fn hidden_self_move_is_not_a_scratch_retirement() {
+        let instr = crate::transformer::LowInstr::Move(crate::transformer::MoveInstr {
+            dst: crate::transformer::Reg(1),
+            src: crate::transformer::Reg(1),
+        });
+        assert!(!super::is_literal_successor_write(&instr));
     }
 }
