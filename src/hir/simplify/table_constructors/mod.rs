@@ -571,6 +571,24 @@ impl TableConstructorPass<'_> {
                 continue;
             }
 
+            // Prefer the complete constructor before any indexed-write fallback. A
+            // fallback consumes SETLIST and prevents the later literal proof from ever
+            // running; for nested literals this changes array capacity and later #.
+            if set_list.values.tail.is_none()
+                && block.stmts.len() <= MAX_GENERIC_SET_LIST_SCAN_STMTS
+                && let Some(seed_index) = self.find_fixed_set_list_seed(block, index, binding)
+                && let Some((constructor, removed)) =
+                    self.fold_fixed_set_list_into_seed(block, index, seed_index, binding, &set_list)
+            {
+                install_constructor_seed(&mut block.stmts[seed_index], constructor);
+                for remove_index in removed.into_iter().rev() {
+                    block.stmts.remove(remove_index);
+                }
+                changed = true;
+                index = seed_index + 1;
+                continue;
+            }
+
             // A canonical fresh seed with a fixed, data-only SETLIST can also be lowered to
             // ordinary indexed writes without moving the seed allocation.  This is deliberately
             // separate from constructor folding: unknown/nil values retain their original write
@@ -663,23 +681,6 @@ impl TableConstructorPass<'_> {
                     continue;
                 }
                 index += 1;
-                continue;
-            }
-
-            let Some(seed_index) = self.find_fixed_set_list_seed(block, index, binding) else {
-                index += 1;
-                continue;
-            };
-
-            if let Some((constructor, removed)) =
-                self.fold_fixed_set_list_into_seed(block, index, seed_index, binding, &set_list)
-            {
-                install_constructor_seed(&mut block.stmts[seed_index], constructor);
-                for remove_index in removed.into_iter().rev() {
-                    block.stmts.remove(remove_index);
-                }
-                changed = true;
-                index = seed_index + 1;
                 continue;
             }
 
@@ -1353,11 +1354,6 @@ impl TableConstructorPass<'_> {
             || constructor_has_numeric_record(seed)
             || constructor_uses_binding(seed, binding)
             || self
-                .debug_identity_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
-            || self
                 .reference_captured_bindings
                 .get(binding)
                 .copied()
@@ -1373,8 +1369,8 @@ impl TableConstructorPass<'_> {
         }
         // The LocalDecl remains the allocation owner. This fixed SETLIST fold only consumes
         // private data-only producer declarations, so it does not need the stronger direct-SSA
-        // proof used when replacing a seed itself. Debug/capture identity is still a hard edge:
-        // moving fields into the initializer changes what hooks or an escaped alias can observe.
+        // proof used when replacing a seed itself. Captured owners stay excluded;
+        // debug owners additionally require a complete literal below.
         let ok = matches!(binding, TableBinding::Local(_)
             if matches!(block.stmts[seed_index], HirStmt::LocalDecl(_))
                 && !self.promotion_facts.compacts_home_slots()
@@ -1480,6 +1476,27 @@ impl TableConstructorPass<'_> {
         // definitely populated value changes `#t`/array-part semantics (for example,
         // `t[1] = x; t[2] = 1` with `x == nil` must not become `{ x, 1 }`).
         if !array_fields_have_safe_nil_shape(&constructor.fields) {
+            return None;
+        }
+        // Preserve the named declaration and fold only its literal initializer. Debug
+        // identities on removed producers were rejected above. References/calls cannot
+        // enter this exception, nor can a promoted non-canonical allocation owner.
+        if self
+            .debug_identity_bindings
+            .get(binding)
+            .copied()
+            .unwrap_or_default()
+            && (!matches!(binding, TableBinding::Local(local)
+                if self.promotion_facts.is_direct_table_seed_local(local)
+                    && self.promotion_facts.trusted_local_home_slot(local).is_some())
+                || constructor.fields.iter().any(|field| match field {
+                    HirTableField::Array(value) => !expr_is_literal_tree(value),
+                    HirTableField::Record(record) => {
+                        !matches!(record.key, HirTableKey::Name(_))
+                            || !expr_is_literal_tree(&record.value)
+                    }
+                }))
+        {
             return None;
         }
         let mut removed = definitions
@@ -2162,6 +2179,11 @@ fn record_key_contains_nil(key: &crate::hir::common::HirTableKey) -> bool {
 }
 
 fn expr_contains_nil(expr: &HirExpr) -> bool {
+    // A completed nested constructor is non-nil; its holes belong to its own
+    // layout, not to the outer SETLIST run being extended.
+    if matches!(expr, HirExpr::TableConstructor(_)) {
+        return false;
+    }
     struct NilProbe {
         found: bool,
     }
