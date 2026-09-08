@@ -12,6 +12,5 @@ pub(super) const REGRESSION_CASES_342_343: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_343_mixed_constructor_array_layout.lua",
         PUC_LUA_51,
-    )
-    .with_expectation(LuaCaseExpectation::TableSetListResidual),
+    ),
 ];

@@ -16,10 +16,13 @@
 //! statement/block 骨架门跳过，不递归扫描无关表达式。
 //! 紧邻的 open-prefix 覆盖交接由子模块原子证明；不能用 freshness 或初始非 nil
 //! 代替物理槽写入、完整数组布局与后续 GC/长度观察的证明。
+//! 同块 seed 从内向外恢复，避免 locals 在父构造器看到已完成子项之前合并 SSA 身份。
+//! 单定义标量 temp 只进入完整 literal；嵌套分配要求根级 primitive/入口 nil 旧槽，不预填 nil。
 
 mod bindings;
 mod builder;
 mod inline_value;
+mod raw_producers;
 mod rebuild;
 mod retired_open;
 mod scan;
@@ -37,9 +40,10 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::bindings::{
     BindingFacts, BindingIndex, BindingOccurrenceIndex, BindingSlots, StmtBindingSummary,
     binding_from_expr, binding_from_lvalue, collect_binding_facts, collect_stmt_binding_summary,
-    expr_uses_binding, table_key_from_expr,
+    expr_uses_binding, root_home_capture_sites, table_key_from_expr,
 };
 use self::builder::expr_is_definitely_non_nil;
+use self::raw_producers::{RawProducerPolicy, safe_producer_overwrites};
 use self::rebuild::producer_value_can_be_dropped;
 use self::scan::{
     ConstructorWriteIndex, constructor_seed, constructor_uses_binding, install_constructor_seed,
@@ -48,7 +52,7 @@ use self::scan::{
 use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
-use super::walk::{HirRewritePass, rewrite_proto};
+use super::walk::{HirRewritePass, rewrite_stmts};
 use crate::hir::simplify::visit::{HirVisitor, visit_stmts};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -171,6 +175,7 @@ pub(super) fn stabilize_table_constructors_in_proto(
         materialized: materialized_bindings,
         reference_captured: reference_captured_bindings,
         reference_captured_home_slots,
+        has_unstructured_control,
     } = collect_binding_facts(&proto.body, promotion_facts, temp_count, first_new_local);
     let mut pass = TableConstructorPass {
         materialized_bindings,
@@ -184,8 +189,13 @@ pub(super) fn stabilize_table_constructors_in_proto(
         dialect,
         temp_count,
         next_local_index: first_new_local,
+        is_single_pass_root: false,
     };
-    let changed = rewrite_proto(proto, &mut pass);
+    let nested_changed = rewrite_stmts(&mut proto.body.stmts, &mut pass);
+    // 根级语句没有回跳时只执行一次；后续捕获不能倒过来保护已经退役的旧 SSA 值。
+    // 嵌套块仍使用全局保护，避免把循环上一轮建立的 capture 当作尚未发生。
+    pass.is_single_pass_root = !has_unstructured_control;
+    let changed = pass.rewrite_block(&mut proto.body) || nested_changed;
     proto
         .local_debug_hints
         .extend((first_new_local..pass.next_local_index).map(|_| None));
@@ -204,6 +214,7 @@ struct TableConstructorPass<'a> {
     dialect: DecompileDialect,
     temp_count: usize,
     next_local_index: usize,
+    is_single_pass_root: bool,
 }
 
 impl HirRewritePass for TableConstructorPass<'_> {
@@ -213,6 +224,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
         }
 
         let mut changed = retired_open::rebuild_retired_prefixes(self, block);
+        // 先完成会压缩语句的原子退役，再建立同一坐标系下的 capture/occurrence 索引。
+        let root_capture_sites = self
+            .is_single_pass_root
+            .then(|| root_home_capture_sites(&block.stmts, self.promotion_facts));
+        let safe_overwrites =
+            safe_producer_overwrites(&block.stmts, self.promotion_facts, self.is_single_pass_root);
         let mut scratch = RebuildScratch::default();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
@@ -229,15 +246,17 @@ impl HirRewritePass for TableConstructorPass<'_> {
             &self.reference_captured_home_slots,
             &self.debug_identity_bindings,
             self.promotion_facts,
+            root_capture_sites.as_ref(),
         );
         let mut stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
         let constructor_writes = ConstructorWriteIndex::new(&block.stmts, &binding_index);
         let materialized_binding_counts =
             binding_index.materialized_counts(&self.materialized_bindings);
-        let mut index = 0;
-        while index < block.stmts.len() {
+        // 倒序重建保持未访问前缀的索引稳定，并在父区域扫描前发布新的子 seed 引用。
+        let mut index = block.stmts.len();
+        while index > 0 {
+            index -= 1;
             let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
-                index += 1;
                 continue;
             };
             let seed_ctor = seed_ctor.clone();
@@ -256,10 +275,26 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     &binding_occurrences,
                     &materialized_binding_counts,
                     &stmt_ids,
+                    RawProducerPolicy {
+                        primitive: self.can_rebuild_primitive_temp_region(binding),
+                        entry_allocations: self.is_single_pass_root,
+                        promotion_facts: self.promotion_facts,
+                        safe_overwrites: &safe_overwrites,
+                    },
                     self.dialect,
                     &mut scratch,
                 );
                 candidate.filter(|(rebuilt_constructor, end_index)| {
+                    let has_temp_producers = block.stmts[index + 1..=*end_index]
+                        .iter()
+                        .any(|stmt| matches!(stmt, HirStmt::Assign(assign)
+                            if assign.targets.iter().any(|target| matches!(target, HirLValue::Temp(_)))));
+                    if has_temp_producers
+                        && (!constructor_is_data_only(rebuilt_constructor)
+                            || constructor_has_numeric_record(rebuilt_constructor))
+                    {
+                        return false;
+                    }
                     let open_local_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self.open_local_constructor_region_is_safe(
                             block,
@@ -303,7 +338,15 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // that the original seed overwrite already precedes every observable RHS;
                     // direct NewTable provenance alone is not such proof.
                     let overwrite_timing_is_safe = open_local_owner
-                        || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
+                        || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding)
+                        || self.literal_constructor_overwrites_are_safe(
+                            block,
+                            index,
+                            *end_index,
+                            binding,
+                            rebuilt_constructor,
+                            &safe_overwrites,
+                        );
                     !invalid_array_shape
                         && !producer_root_is_observable
                         && (open_local_owner || !has_followup_object_write)
@@ -318,11 +361,13 @@ impl HirRewritePass for TableConstructorPass<'_> {
             };
 
             if !rebuilt_region {
-                index += 1;
                 continue;
             }
 
             install_constructor_seed(&mut block.stmts[index], constructor);
+            let new_summary = collect_stmt_binding_summary(&block.stmts[index], &mut binding_index);
+            binding_occurrences.replace_stmt(stmt_ids[index], &stmt_bindings[index], &new_summary);
+            stmt_bindings[index] = new_summary;
             let drain_end = end_index;
             if drain_end > index {
                 for i in index + 1..=drain_end {
@@ -333,7 +378,6 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 stmt_ids.drain(index + 1..=drain_end);
             }
             changed = true;
-            index += 1;
         }
 
         changed |= self.materialize_safe_fixed_set_lists(block);
@@ -405,6 +449,67 @@ fn stmt_writes_table_binding(stmt: &HirStmt, binding: TableBinding) -> bool {
 }
 
 impl TableConstructorPass<'_> {
+    // 分配点之间可以触发 GC。被推迟的所有槽写必须覆盖已证明的 primitive/入口 nil，
+    // 字段也必须完全由字面量组成；循环和未知旧对象覆盖不适用。
+    fn literal_constructor_overwrites_are_safe(
+        &self,
+        block: &crate::hir::common::HirBlock,
+        seed_index: usize,
+        end_index: usize,
+        binding: TableBinding,
+        constructor: &HirTableConstructor,
+        safe_overwrites: &BTreeSet<TempId>,
+    ) -> bool {
+        let TableBinding::Temp(temp) = binding else {
+            return false;
+        };
+        self.is_single_pass_root
+            && self.can_rebuild_primitive_temp_region(binding)
+            && safe_overwrites.contains(&temp)
+            && constructor.fields.iter().all(|field| match field {
+                HirTableField::Array(value) => expr_is_literal_tree(value),
+                HirTableField::Record(record) => {
+                    matches!(record.key, HirTableKey::Name(_))
+                        && expr_is_literal_tree(&record.value)
+                }
+            })
+            && constructor.trailing_multivalue.is_none()
+            && block.stmts[seed_index + 1..=end_index]
+                .iter()
+                .all(|stmt| match stmt {
+                    HirStmt::Assign(assign) => assign.targets.iter().all(|target| match target {
+                        HirLValue::Temp(value) => safe_overwrites.contains(value),
+                        HirLValue::TableAccess(access) => {
+                            binding_from_expr(&access.base) == Some(binding)
+                        }
+                        _ => false,
+                    }),
+                    HirStmt::TableSetList(batch) => binding_from_expr(&batch.base) == Some(binding),
+                    _ => false,
+                })
+    }
+
+    fn can_rebuild_primitive_temp_region(&self, binding: TableBinding) -> bool {
+        let TableBinding::Temp(temp) = binding else {
+            return false;
+        };
+        self.dialect == DecompileDialect::Lua51
+            && !self.promotion_facts.compacts_home_slots()
+            && self.promotion_facts.is_direct_table_seed_temp(temp)
+            && self.promotion_facts.trusted_temp_home_slot(temp).is_some()
+            && self.materialized_bindings.get(binding).copied() == Some(1)
+            && !self
+                .debug_identity_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            && !self
+                .reference_captured_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+    }
+
     /// Lower a fixed SETLIST to indexed writes only when an explicit fresh seed dominates it.
     /// Keeping the seed statement intact preserves its allocation point and avoids changing
     /// raw SETLIST writes on shared or metatable-bearing tables into ordinary assignments.
@@ -1673,6 +1778,22 @@ fn expr_is_data_only(expr: &HirExpr) -> bool {
                 .is_none_or(|tail| expr_is_data_only(tail.as_expr()))
         }
         _ => false,
+    }
+}
+
+fn expr_is_literal_tree(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::TableConstructor(table) => {
+            table.trailing_multivalue.is_none()
+                && table.fields.iter().all(|field| match field {
+                    HirTableField::Array(value) => expr_is_literal_tree(value),
+                    HirTableField::Record(record) => {
+                        matches!(record.key, HirTableKey::Name(_))
+                            && expr_is_literal_tree(&record.value)
+                    }
+                })
+        }
+        _ => producer_value_can_be_dropped(expr) && expr_is_data_only(expr),
     }
 }
 

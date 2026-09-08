@@ -1,10 +1,11 @@
 //! 这个子模块负责 table-constructor pass 里的 binding 识别与字段键翻译。
 //!
 //! 它依赖 HIR 已经分好的 lvalue/expr 形状，回答“这个读写是不是同一个构造器绑定”，
-//! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
+//! 并用稳定 stmt id 索引 binding 的 use/mention 与首次捕获位置；不会重建字段序列。
+//! 根级无回跳的旧 SSA producer 不受更晚同槽 capture 影响，嵌套块仍保守保护整个槽。
 //! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ast::{DecompileDialect, is_lua_identifier_name};
@@ -14,7 +15,7 @@ use crate::hir::common::{
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{BindingId, TableBinding};
-use crate::hir::simplify::visit::{HirVisitor, visit_block, visit_stmts};
+use crate::hir::simplify::visit::{HirVisitor, visit_stmts};
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
     match lvalue {
@@ -53,6 +54,7 @@ pub(super) struct BindingFacts {
     pub(super) materialized: BindingSlots<u32>,
     pub(super) reference_captured: BindingSlots<bool>,
     pub(super) reference_captured_home_slots: BTreeSet<HomeSlotKey>,
+    pub(super) has_unstructured_control: bool,
 }
 
 fn binding_home_slot(
@@ -76,12 +78,54 @@ pub(super) fn collect_binding_facts(
         materialized: BindingSlots::new(temp_count, local_count),
         reference_captured: BindingSlots::new(temp_count, local_count),
         reference_captured_home_slots: BTreeSet::new(),
+        has_unstructured_control: false,
     };
-    visit_block(block, &mut collector);
+    for stmt in &block.stmts {
+        visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    }
     BindingFacts {
         materialized: collector.materialized,
         reference_captured: collector.reference_captured,
         reference_captured_home_slots: collector.reference_captured_home_slots,
+        has_unstructured_control: collector.has_unstructured_control,
+    }
+}
+
+pub(super) fn root_home_capture_sites(
+    stmts: &[HirStmt],
+    promotion_facts: &ProtoPromotionFacts,
+) -> BTreeMap<HomeSlotKey, usize> {
+    let mut collector = RootCaptureCollector {
+        promotion_facts,
+        sites: BTreeMap::new(),
+        stmt_index: 0,
+    };
+    for (index, stmt) in stmts.iter().enumerate() {
+        collector.stmt_index = index;
+        visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    }
+    collector.sites
+}
+
+struct RootCaptureCollector<'a> {
+    promotion_facts: &'a ProtoPromotionFacts,
+    sites: BTreeMap<HomeSlotKey, usize>,
+    stmt_index: usize,
+}
+
+impl HirVisitor for RootCaptureCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::Closure(closure) = expr {
+            for binding in closure
+                .captures
+                .iter()
+                .filter_map(|capture| binding_from_expr(&capture.value))
+            {
+                if let Some(home) = binding_home_slot(binding, self.promotion_facts) {
+                    self.sites.entry(home).or_insert(self.stmt_index);
+                }
+            }
+        }
     }
 }
 
@@ -271,6 +315,7 @@ pub(super) struct BindingOccurrenceIndex {
     uses: Vec<BTreeSet<usize>>,
     mentions: Vec<BTreeSet<usize>>,
     sticky_uses: Vec<bool>,
+    home_capture_sites: Vec<Option<usize>>,
 }
 
 impl BindingOccurrenceIndex {
@@ -281,6 +326,7 @@ impl BindingOccurrenceIndex {
         reference_captured_home_slots: &BTreeSet<HomeSlotKey>,
         debug_identity_bindings: &BindingSlots<bool>,
         promotion_facts: &ProtoPromotionFacts,
+        root_capture_sites: Option<&BTreeMap<HomeSlotKey, usize>>,
     ) -> Self {
         let mut index = Self {
             uses: vec![BTreeSet::new(); binding_index.len()],
@@ -297,8 +343,21 @@ impl BindingOccurrenceIndex {
                             .get(*binding)
                             .copied()
                             .unwrap_or_default()
-                        || binding_home_slot(*binding, promotion_facts)
-                            .is_some_and(|slot| reference_captured_home_slots.contains(&slot))
+                        || root_capture_sites.is_none()
+                            && binding_home_slot(*binding, promotion_facts)
+                                .is_some_and(|slot| reference_captured_home_slots.contains(&slot))
+                })
+                .collect(),
+            home_capture_sites: binding_index
+                .bindings
+                .iter()
+                .map(|binding| {
+                    root_capture_sites
+                        .and_then(|sites| {
+                            binding_home_slot(*binding, promotion_facts)
+                                .and_then(|slot| sites.get(&slot))
+                        })
+                        .copied()
                 })
                 .collect(),
         };
@@ -334,6 +393,21 @@ impl BindingOccurrenceIndex {
             self.mentions[binding_id].remove(&stmt_id);
         }
     }
+
+    pub(super) fn replace_stmt(
+        &mut self,
+        stmt_id: usize,
+        old: &StmtBindingSummary,
+        new: &StmtBindingSummary,
+    ) {
+        self.remove_stmt(stmt_id, old);
+        for binding_id in new.uses() {
+            self.uses[binding_id].insert(stmt_id);
+        }
+        for binding_id in new.mentions() {
+            self.mentions[binding_id].insert(stmt_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -349,6 +423,13 @@ impl BindingUseSummary<'_> {
             .get(binding_id)
             .copied()
             .unwrap_or_default()
+            || self
+                .index
+                .home_capture_sites
+                .get(binding_id)
+                .copied()
+                .flatten()
+                .is_some_and(|first_capture| first_capture <= self.after_stmt)
             || self.index.uses.get(binding_id).is_some_and(|occurrences| {
                 occurrences
                     .range((Excluded(self.after_stmt), Unbounded))
@@ -365,10 +446,12 @@ struct BindingFactCollector<'a> {
     // constructor rewrite can otherwise move a declaration before a closure observes it.
     reference_captured: BindingSlots<bool>,
     reference_captured_home_slots: BTreeSet<HomeSlotKey>,
+    has_unstructured_control: bool,
 }
 
 impl HirVisitor for BindingFactCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.has_unstructured_control |= matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_));
         match stmt {
             HirStmt::LocalDecl(local_decl) => {
                 for binding in &local_decl.bindings {

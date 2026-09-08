@@ -36,3 +36,9 @@ local function inspect()
     print("regress_331", #rows, total)
 end
 inspect()
+local first, second, third, fourth = 10, 20, 30, 40
+local function capture_later()
+    first = first + 1
+    return first + second + third + fourth
+end
+print("later-capture", capture_later(), capture_later())

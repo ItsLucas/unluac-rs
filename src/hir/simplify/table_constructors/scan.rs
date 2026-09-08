@@ -3,6 +3,8 @@
 //! 它依赖 HIR 已经稳定的赋值/构造器形状，只回答“哪些 stmt 可视为构造器 seed、record、
 //! setlist 或 producer”，不会在这里直接改写语句。
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
+//! 尚未压缩的单定义 temp 允许标量 literal producer；primitive/入口 nil 槽的嵌套 literal 另有
+//! 显式策略。两者仍共用 region 的捕获、唯一消费与求值事件证明，不接管已有 local 覆盖。
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
@@ -11,9 +13,14 @@ use super::bindings::{
     BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
 };
 use super::builder::ConstructorBuilder;
+use super::raw_producers::RawProducerPolicy;
 use super::rebuild::producer_value_can_be_dropped;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
-use super::{BindingId, RebuildScratch, RegionStep, TableBinding};
+use super::{
+    BindingId, RebuildScratch, RegionStep, TableBinding, expr_is_data_only, expr_is_literal_tree,
+};
+
+const LUA51_FIELDS_PER_FLUSH: usize = 50;
 
 /// 按稳定 stmt id 记录每个 binding 最后可能扩展构造器的位置。
 ///
@@ -118,6 +125,7 @@ pub(super) fn try_rebuild_constructor_region(
     binding_occurrences: &BindingOccurrenceIndex,
     materialized_binding_counts: &[u32],
     stmt_ids: &[usize],
+    raw_producers: RawProducerPolicy<'_>,
     dialect: DecompileDialect,
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize)> {
@@ -131,7 +139,15 @@ pub(super) fn try_rebuild_constructor_region(
         let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
         let boundary_step = if keyed_write_step(stmt, binding) {
             RegionStep::Record { stmt_index: index }
-        } else if let Some(producer_bindings) = producer_steps(stmt, index, binding, &mut steps) {
+        } else if let Some(producer_bindings) = producer_steps(
+            stmt,
+            index,
+            binding,
+            &mut steps,
+            raw_producers,
+            binding_index,
+            materialized_binding_counts,
+        ) {
             for producer_binding in producer_bindings {
                 let binding_id = binding_index
                     .id_of(producer_binding)
@@ -165,6 +181,16 @@ pub(super) fn try_rebuild_constructor_region(
             best_end = Some(index);
             steps.clear();
             use_horizon = None;
+            // Lua 5.1 的不足 50 项固定批次结束当前 list 构造；后面的显式字段覆盖
+            // 不属于该 initializer，不能吞进来后又因 nil/布局检查丢掉已证明的前缀。
+            if raw_producers.primitive
+                && matches!(stmt, HirStmt::TableSetList(batch)
+                    if batch.values.tail.is_none()
+                        && !batch.values.fixed.is_empty()
+                        && batch.values.fixed.len() < LUA51_FIELDS_PER_FLUSH)
+            {
+                break;
+            }
         } else {
             // horizon 已覆盖未来对现有 producer 的引用；后缀无法改写已失败的 segment。
             break;
@@ -208,6 +234,9 @@ fn producer_steps(
     stmt_index: usize,
     constructor_binding: TableBinding,
     steps: &mut Vec<RegionStep>,
+    raw_producers: RawProducerPolicy<'_>,
+    binding_index: &BindingIndex,
+    materialized_binding_counts: &[u32],
 ) -> Option<Vec<TableBinding>> {
     match stmt {
         HirStmt::LocalDecl(local_decl) if local_decl.values.tail.is_none() => {
@@ -224,8 +253,64 @@ fn producer_steps(
                 steps,
             )
         }
-        // Existing assignments keep the physical overwrite point of their target.  They may
-        // own a source-visible value even when the result is consumed only once.
+        // 原始单定义 temp 的标量 producer 必须在槽压缩之前与整个构造器一起恢复；
+        // 已有 local 的赋值和可观察 producer 仍保留其真实覆盖点。
+        HirStmt::Assign(assign)
+            if raw_producers.primitive
+                && assign.values.tail.is_none()
+                && assign.values.fixed.iter().all(|value| {
+                    producer_value_can_be_dropped(value) && expr_is_data_only(value)
+                        || raw_producers.entry_allocations
+                            && matches!(value, HirExpr::TableConstructor(_))
+                            && expr_is_literal_tree(value)
+                }) =>
+        {
+            let bindings = assign
+                .targets
+                .iter()
+                .map(|target| match target {
+                    HirLValue::Temp(temp)
+                        if raw_producers
+                            .promotion_facts
+                            .trusted_temp_home_slot(*temp)
+                            .is_some()
+                            && raw_producers.safe_overwrites.contains(temp) =>
+                    {
+                        Some(TableBinding::Temp(*temp))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if bindings.iter().any(|binding| {
+                binding_index
+                    .id_of(*binding)
+                    .and_then(|id| materialized_binding_counts.get(id))
+                    != Some(&1)
+            }) {
+                return None;
+            }
+            for (binding, value) in bindings.iter().zip(&assign.values.fixed) {
+                if matches!(value, HirExpr::TableConstructor(_)) {
+                    let TableBinding::Temp(temp) = binding else {
+                        return None;
+                    };
+                    let facts = raw_producers.promotion_facts;
+                    if !raw_producers.entry_allocations
+                        || !raw_producers.safe_overwrites.contains(temp)
+                        || !facts.is_direct_table_seed_temp(*temp)
+                    {
+                        return None;
+                    }
+                }
+            }
+            producer_steps_from_bindings(
+                bindings,
+                &assign.values,
+                constructor_binding,
+                stmt_index,
+                steps,
+            )
+        }
         HirStmt::Assign(_) => None,
         _ => None,
     }
@@ -284,6 +369,17 @@ pub(super) fn seed_overwrite_delay_is_unobservable(
                         .all(|value| !expr_uses_binding(value, binding))
             }
             HirStmt::Assign(assign) => {
+                if assign
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, HirLValue::Temp(_)))
+                {
+                    return assign.values.tail.is_none()
+                        && assign.targets.len() == assign.values.fixed.len()
+                        && assign.values.fixed.iter().all(|value| {
+                            producer_value_can_be_dropped(value) && expr_is_data_only(value)
+                        });
+                }
                 let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
                     return false;
                 };
