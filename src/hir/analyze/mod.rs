@@ -5,6 +5,7 @@
 //! 保持一致，后续继续拆分实现时也更容易定位“入口”与“细节”。
 
 mod artifact_recovery;
+mod array_constructor_regions;
 mod bindings;
 mod exprs;
 mod helpers;
