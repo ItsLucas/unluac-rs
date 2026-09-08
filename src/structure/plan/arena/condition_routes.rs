@@ -16,23 +16,34 @@ pub(super) fn prune_non_iteration_branch_tail_continues(
         ));
     }
     let branch_tail_edges = index_branch_tail_edges(cfg, arena)?;
+    let mut fence_tail_edges = vec![false; cfg.edges.len()];
+    for fence in &arena.single_passes {
+        for edge in &cfg.succs[fence.tail.index()] {
+            if cfg.edges[edge.index()].to == fence.continuation {
+                fence_tail_edges[edge.index()] = true;
+            }
+        }
+    }
     for (loop_, partition) in input.loops.iter().zip(partitions) {
         let candidate = &loop_.candidate;
         let body = &partition.body;
         partition.continues.retain(|edge| {
-            !branch_tail_edges[edge.index()]
-                || loop_.semantic_continue_edges.contains(edge)
-                || caps.continue_stmt
-                    && continue_edge_bypasses_body_parts(cfg, body, *edge)
-                    && !(candidate.kind_hint == crate::structure::LoopKindHint::RepeatLike
-                        && candidate.continue_target.is_some_and(|target| {
-                            branch_conditions_share_subject(
-                                proto,
-                                cfg,
-                                cfg.edges[edge.index()].from,
-                                target,
-                            )
-                        }))
+            // A fence's normal completion cannot also be an explicit continue,
+            // even when its continuation is the enclosing VM-for control block.
+            !fence_tail_edges[edge.index()]
+                && (!branch_tail_edges[edge.index()]
+                    || loop_.semantic_continue_edges.contains(edge)
+                    || caps.continue_stmt
+                        && continue_edge_bypasses_body_parts(cfg, body, *edge)
+                        && !(candidate.kind_hint == crate::structure::LoopKindHint::RepeatLike
+                            && candidate.continue_target.is_some_and(|target| {
+                                branch_conditions_share_subject(
+                                    proto,
+                                    cfg,
+                                    cfg.edges[edge.index()].from,
+                                    target,
+                                )
+                            })))
         });
     }
     Ok(())

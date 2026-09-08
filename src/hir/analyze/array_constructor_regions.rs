@@ -5,10 +5,14 @@
 //! allocation operands and 50-field flushes. Its only escaping value is installed by
 //! the immediately following SETGLOBAL. No seed, scratch assignment or field write
 //! may survive independently, and the global store stays after every RHS effect.
-//! The entry prefix must also keep the register frame anchored: only consecutive
-//! call-result locals with multiple later reads are accepted. An unread prefix root
+//! The entry prefix must also keep the register frame anchored: calls either discard
+//! all results or declare locals with multiple later reads. An unread prefix root
 //! could otherwise disappear during cleanup and change indirect-GC observations.
+//! Record-only children additionally preserve each string-key write and lookup chain.
 
+mod records;
+
+use super::exprs::expr_for_const;
 use super::helpers::concat_expr;
 use super::instrs::lower_regular_instr;
 use super::lower::ProtoLowering;
@@ -30,6 +34,10 @@ const MAX_DEPTH: usize = 64;
 #[cfg(test)]
 #[path = "array_constructor_regions/regressions_397.rs"]
 mod regressions_397;
+
+#[cfg(test)]
+#[path = "array_constructor_regions/regressions_398.rs"]
+mod regressions_398;
 
 pub(super) fn recover_global_arrays(body: &mut HirBlock, lowering: &ProtoLowering<'_>) {
     if lowering.target.version != DecompileDialect::Lua51
@@ -91,10 +99,10 @@ fn global_array_region(
         root: new_table.dst,
         start,
         cursor: start,
-        has_call: false,
+        has_observable_producer: false,
     };
     let expression = parser.table(0)?;
-    if !parser.has_call {
+    if !parser.has_observable_producer {
         return None;
     }
     let end = parser.cursor;
@@ -190,8 +198,7 @@ fn canonical_prefix_keeps_frame(
         let Some(LowInstr::Call(call)) = proto.instrs.get(pc) else {
             return false;
         };
-        let (ValuePack::Fixed(arguments), ResultPack::Fixed(results)) = (call.args, call.results)
-        else {
+        let ValuePack::Fixed(arguments) = call.args else {
             return false;
         };
         if pc >= end
@@ -200,9 +207,17 @@ fn canonical_prefix_keeps_frame(
             || call.callee.index() != slot
             || arguments.start.index() != slot + 1
             || arguments.len != args
-            || results.start.index() != slot
-            || results.len != 1
         {
+            return false;
+        }
+        if call.results == ResultPack::Ignore {
+            pc += 1;
+            continue;
+        }
+        let ResultPack::Fixed(results) = call.results else {
+            return false;
+        };
+        if results.start.index() != slot || results.len != 1 {
             return false;
         }
         let [def] = dataflow.instr_defs[pc].as_slice() else {
@@ -229,7 +244,7 @@ struct ArrayParser<'a, 'b> {
     root: Reg,
     start: usize,
     cursor: usize,
-    has_call: bool,
+    has_observable_producer: bool,
 }
 
 impl ArrayParser<'_, '_> {
@@ -271,7 +286,10 @@ impl ArrayParser<'_, '_> {
         };
         let allocation = seed.lua51_allocation?;
         if allocation.hash_hint != 0 {
-            return None;
+            if depth == 0 || allocation.array_hint != 0 {
+                return None;
+            }
+            return self.record_table(seed);
         }
         let base = seed.dst.index();
         self.cursor += 1;
@@ -338,7 +356,7 @@ impl ArrayParser<'_, '_> {
                         fastcall: None,
                         method_name: None,
                     })));
-                    self.has_call = true;
+                    self.has_observable_producer = true;
                 }
                 LowInstr::Concat(concat) if concat.dst == concat.src.start => {
                     let first = concat.dst.index().checked_sub(base + 1)?;
