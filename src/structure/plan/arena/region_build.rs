@@ -1,4 +1,4 @@
-//! Region arena 的构建与物化。输入规范化 container/loop partitions，输出 containment tree、direct block owner 与导航索引；不负责冻结 edge transfer。例如 structured child 会先物化，再嵌入最小 residual island。
+//! Region arena 的构建与物化。输入规范化 container/loop partitions，输出 containment tree、direct block owner 与导航索引；不负责冻结 edge transfer。例如 structured child 会先物化，再嵌入最小 residual island。正常完成性必须在 sequence 按 CFG 排序后冻结，不能消费物理布局的旧尾部。
 
 use super::*;
 
@@ -665,8 +665,9 @@ pub(super) fn materialize_regions(
             region.ok_or_else(|| StructureError::invalid(format!("region #{index} was not filled")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let navigation = RegionNavigation::build(cfg, root, &regions, &region_by_block)?;
+    let mut navigation = RegionNavigation::build(cfg, root, &regions, &region_by_block)?;
     order_sequence_children_by_flow(cfg, graph_facts, &mut regions, &navigation)?;
+    navigation.freeze_region_facts(&regions)?;
     let mut ports = navigation.collect_island_ports(cfg, &regions)?;
     for (index, region) in regions.iter_mut().enumerate() {
         let RegionPlan::Unstructured { entries, exits, .. } = region else {

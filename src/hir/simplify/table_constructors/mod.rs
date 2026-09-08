@@ -14,11 +14,14 @@
 //! HIR 形状，为后续 AST 降低继续减负。
 //! 全量 binding facts 只服务这些候选；没有 seed/SETLIST 根形状的 proto 先通过
 //! statement/block 骨架门跳过，不递归扫描无关表达式。
+//! 紧邻的 open-prefix 覆盖交接由子模块原子证明；不能用 freshness 或初始非 nil
+//! 代替物理槽写入、完整数组布局与后续 GC/长度观察的证明。
 
 mod bindings;
 mod builder;
 mod inline_value;
 mod rebuild;
+mod retired_open;
 mod scan;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -209,7 +212,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
             return false;
         }
 
-        let mut changed = false;
+        let mut changed = retired_open::rebuild_retired_prefixes(self, block);
         let mut scratch = RebuildScratch::default();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
@@ -1697,8 +1700,9 @@ fn expr_is_open_tail_safe(expr: &HirExpr) -> bool {
         {
             HirTableField::Array(value) => expr_is_open_tail_safe(value),
             HirTableField::Record(record) => {
-                matches!(&record.key, HirTableKey::Name(_))
-                    || matches!(&record.key, HirTableKey::Expr(key) if expr_is_open_tail_safe(key))
+                (matches!(&record.key, HirTableKey::Name(_))
+                    || matches!(&record.key, HirTableKey::Expr(key) if expr_is_open_tail_safe(key)))
+                    && expr_is_open_tail_safe(&record.value)
             }
         })
             && constructor

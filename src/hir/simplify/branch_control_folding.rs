@@ -1,15 +1,19 @@
-//! branch-control 收敛：删除无求值行为的空/常量分支，把公共 direct-copy 尾部移出分支，
-//! 将 repeat 尾部的单次 break guard 收回 until 条件，并把残留前向 goto 壳恢复成普通条件结构。
+//! branch-control 收敛：删除无求值行为的空/常量分支，把公共 direct-copy/goto 尾部移出分支，
+//! 将 repeat 尾部的单次 break guard 收回 until 条件，并把残留 goto 壳恢复成普通条件结构。
 //!
 //! 这里只消费已经存在的 `If/Goto/Label`，不重新解释 CFG，也不接管同一 lvalue 选值；
 //! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
 //! 位置和引用计数，再按不交叉区间从右向左改写，避免多个 guard 共用 label 时反复全块
 //! 扫描和重建。
+//! 词法 continuation 只穿过尾部 if/do 传播，共享终态路由只消费封闭入口与单个终态
+//! transfer；两者都不跨 loop/cleanup 边界，也不移动 predicate producer 或 edge copy。
 //!
 //! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
 //! 的词法作用域后去掉条件壳；动态 lookup、调用、table 构造与元方法比较都不进入该规则。
 
+mod continuations;
 mod path_conditions;
+mod terminal_routes;
 
 use std::collections::BTreeMap;
 
@@ -30,6 +34,7 @@ pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
     let mut changed = false;
     loop {
         let path_changed = path_conditions::specialize_stable_path_conditions(proto);
+        changed |= continuations::fold_lexical_continuations(&mut proto.body, None);
         changed |= path_changed | rewrite_proto(proto, &mut BranchControlPass);
         // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
         // 单调链，避免合法的长链逐项消耗全局 scheduler 的固定轮次预算。
@@ -44,16 +49,19 @@ struct BranchControlPass;
 impl HirRewritePass for BranchControlPass {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let constant_changed = fold_constant_control(&mut block.stmts);
-        let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
+        let common_tail_changed = sink_common_branch_tails(&mut block.stmts);
         let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
+        let terminal_routes_changed =
+            terminal_routes::fold_shared_terminal_routes(&mut block.stmts);
         let alternative_guard_changed = fold_alternative_guard_routes(&mut block.stmts);
         let leading_escape_changed = fold_leading_branch_escapes(&mut block.stmts);
-        let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
-        let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
+        let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse, None);
+        let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard, None);
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
             || empty_changed
+            || terminal_routes_changed
             || alternative_guard_changed
             || leading_escape_changed
             || terminal_changed
@@ -62,7 +70,8 @@ impl HirRewritePass for BranchControlPass {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        fold_trailing_repeat_break_condition(stmt)
+        fold_sibling_branch_escapes(stmt)
+            || fold_trailing_repeat_break_condition(stmt)
             || fold_effect_only_call(stmt)
             || fold_leading_while_break_guard(stmt)
             || naturalize_if_polarity(stmt)
@@ -119,9 +128,8 @@ fn fold_alternative_guard_routes(stmts: &mut Vec<HirStmt>) -> bool {
     changed
 }
 
-// A leading guard may jump to the label immediately after its containing if:
-// `if a then if b then goto L end; body end; ::L::`. Move only the guard
-// into the condition, preserving short-circuit evaluation and the body's scope.
+// 入口 guard 可以进入另一 arm 的首 label，或进入整个 if 的词法 continuation；
+// 只合并条件，保留各 arm 正文与 producer/cleanup 的原有作用域和执行顺序。
 fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
     let mut changed = false;
     for index in 0..stmts.len().saturating_sub(1) {
@@ -142,20 +150,85 @@ fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
         {
             continue;
         }
-        let Some(guard) = branch.then_block.stmts.first() else {
-            continue;
-        };
-        let Some(escape) = leading_escape_condition(guard, target) else {
-            continue;
-        };
-        branch.cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
-            lhs: std::mem::replace(&mut branch.cond, HirExpr::Boolean(false)),
-            rhs: normalize_condition_context(&escape, true).expr,
-        }));
-        branch.then_block.stmts.remove(0);
-        changed = true;
+        changed |= fold_arm_escape(&mut branch.cond, &mut branch.then_block, target, true);
     }
     changed
+}
+
+fn fold_sibling_branch_escapes(stmt: &mut HirStmt) -> bool {
+    // `if a then if b then T else goto E end else ::E:: F end`
+    // 收成 `if a and b then T else F end`；label 仍由全 proto 引用清扫决定是否删除。
+    let HirStmt::If(branch) = stmt else {
+        return false;
+    };
+    let Some(otherwise) = &mut branch.else_block else {
+        return false;
+    };
+    if let Some(HirStmt::Label(label)) = otherwise.stmts.first()
+        && label.tbc_barriers.is_empty()
+        && fold_arm_escape(&mut branch.cond, &mut branch.then_block, label.id, true)
+    {
+        return true;
+    }
+    if let Some(HirStmt::Label(label)) = branch.then_block.stmts.first()
+        && label.tbc_barriers.is_empty()
+    {
+        return fold_arm_escape(&mut branch.cond, otherwise, label.id, false);
+    }
+    false
+}
+
+fn fold_arm_escape(
+    cond: &mut HirExpr,
+    body: &mut HirBlock,
+    target: HirLabelId,
+    from_then: bool,
+) -> bool {
+    let Some(escape) = take_leading_escape(body, target) else {
+        return false;
+    };
+    let logical = Box::new(HirLogicalExpr {
+        lhs: std::mem::replace(cond, HirExpr::Boolean(false)),
+        rhs: normalize_condition_context(&escape, from_then).expr,
+    });
+    *cond = if from_then {
+        HirExpr::LogicalAnd(logical)
+    } else {
+        HirExpr::LogicalOr(logical)
+    };
+    true
+}
+
+fn take_leading_escape(body: &mut HirBlock, target: HirLabelId) -> Option<HirExpr> {
+    if let Some(escape) = body
+        .stmts
+        .first()
+        .and_then(|guard| leading_escape_condition(guard, target))
+    {
+        body.stmts.remove(0);
+        return Some(escape);
+    }
+    let [HirStmt::If(guard)] = body.stmts.as_slice() else {
+        return None;
+    };
+    let then_escapes =
+        matches!(guard.then_block.stmts.as_slice(), [HirStmt::Goto(jump)] if jump.target == target);
+    let else_escapes = guard.else_block.as_ref().is_some_and(|otherwise| {
+        matches!(otherwise.stmts.as_slice(), [HirStmt::Goto(jump)] if jump.target == target)
+    });
+    if then_escapes == else_escapes {
+        return None;
+    }
+    let HirStmt::If(mut guard) = body.stmts.pop().expect("matched single branch") else {
+        unreachable!();
+    };
+    let escape = normalize_condition_context(&guard.cond, !then_escapes).expr;
+    *body = if then_escapes {
+        guard.else_block.take().unwrap_or_default()
+    } else {
+        guard.then_block
+    };
+    Some(escape)
 }
 
 fn leading_escape_condition(stmt: &HirStmt, target: HirLabelId) -> Option<HirExpr> {
@@ -182,17 +255,19 @@ fn leading_escape_condition(stmt: &HirStmt, target: HirLabelId) -> Option<HirExp
     }
 }
 
-fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
+fn sink_common_branch_tails(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut changed = fold_terminal_else_tail(stmts);
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
-    let mut changed = false;
 
     for stmt in original {
         let HirStmt::If(mut if_stmt) = stmt else {
             rewritten.push(stmt);
             continue;
         };
-        let Some(common_tail) = take_common_direct_copy_tail(&mut if_stmt) else {
+        let Some(common_tail) = take_common_direct_copy_tail(&mut if_stmt)
+            .or_else(|| take_common_goto_tail(&mut if_stmt))
+        else {
             rewritten.push(HirStmt::If(if_stmt));
             continue;
         };
@@ -203,6 +278,36 @@ fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
 
     *stmts = rewritten;
     changed
+}
+
+fn fold_terminal_else_tail(stmts: &mut Vec<HirStmt>) -> bool {
+    let Some((tail, prefix)) = stmts.split_last() else {
+        return false;
+    };
+    if !matches!(
+        tail,
+        HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue
+    ) {
+        return false;
+    }
+    let Some(branch) = prefix.last() else {
+        return false;
+    };
+    let Some((_, invert)) = fold_target(branch, FoldKind::TerminalElse)
+        .or_else(|| fold_target(branch, FoldKind::Guard))
+    else {
+        return false;
+    };
+    let tail = stmts.pop().expect("matched terminal successor");
+    let Some(HirStmt::If(branch)) = stmts.last_mut() else {
+        unreachable!();
+    };
+    if invert {
+        branch.cond = normalize_condition_context(&branch.cond, true).expr;
+        branch.then_block = branch.else_block.take().expect("matched inverted arm");
+    }
+    branch.else_block = Some(HirBlock { stmts: vec![tail] });
+    true
 }
 
 fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
@@ -219,6 +324,56 @@ fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
         return None;
     }
 
+    take_common_tail(if_stmt)
+}
+
+fn take_common_goto_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
+    let else_block = if_stmt.else_block.as_ref()?;
+    let (target, pop_then, pop_else) =
+        match (if_stmt.then_block.stmts.last()?, else_block.stmts.last()?) {
+            (HirStmt::Goto(left), HirStmt::Goto(right)) if left.target == right.target => {
+                (left.target, true, true)
+            }
+            (HirStmt::Goto(jump), HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue) => {
+                (jump.target, true, false)
+            }
+            (HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue, HirStmt::Goto(jump)) => {
+                (jump.target, false, true)
+            }
+            _ => return None,
+        };
+    let mut boundary = GotoTailBoundary {
+        target,
+        defined_inside: false,
+    };
+    visit_block(&if_stmt.then_block, &mut boundary);
+    visit_block(else_block, &mut boundary);
+    if boundary.defined_inside {
+        return None;
+    }
+    // 两臂先完成各自 cleanup 再跳到共同外部目标；移到 if 后没有新增求值事件。
+    // 已 return/break/continue 的臂不会执行后置 goto；其终态求值仍留在原 arm。
+    if pop_then && pop_else {
+        take_common_tail(if_stmt)
+    } else if pop_then {
+        if_stmt.then_block.stmts.pop()
+    } else {
+        if_stmt.else_block.as_mut()?.stmts.pop()
+    }
+}
+
+struct GotoTailBoundary {
+    target: HirLabelId,
+    defined_inside: bool,
+}
+
+impl HirVisitor for GotoTailBoundary {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.defined_inside |= matches!(stmt, HirStmt::Label(label) if label.id == self.target);
+    }
+}
+
+fn take_common_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
     let common_tail = if_stmt.then_block.stmts.pop()?;
     let removed_else_tail = if_stmt.else_block.as_mut()?.stmts.pop();
     debug_assert_eq!(removed_else_tail.as_ref(), Some(&common_tail));
@@ -566,8 +721,15 @@ struct FoldCandidate {
     invert_cond: bool,
 }
 
-fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
-    let label_indices = index_top_level_labels(stmts);
+fn fold_forward_gotos(
+    stmts: &mut Vec<HirStmt>,
+    kind: FoldKind,
+    continuation: Option<HirLabelId>,
+) -> bool {
+    let mut label_indices = index_top_level_labels(stmts);
+    if let Some(target) = continuation {
+        label_indices.entry(target).or_insert(stmts.len());
+    }
     let label_refs = count_label_references(stmts);
     let mut groups = BTreeMap::<usize, FoldGroup>::new();
 
@@ -582,8 +744,11 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
+        // 同 block 的值合流先交给 branch-values；祖先 continuation 尚无本地 label，
+        // 必须先恢复 if/else 的控制壳，才能让值 pass 消费 arm 内原位的并行 copy。
         if !can_move_into_branch(body, kind)
             || matches!(kind, FoldKind::TerminalElse)
+                && label_index < stmts.len()
                 && is_branch_value_assignment(stmt, body, invert_cond)
         {
             continue;
@@ -609,8 +774,8 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
     // 可移动区间不含顶层 label，因此不同目标的区间不会交叉。倒序改写可保持更早
     // 区间的原始索引稳定；同一 label 的多个 guard 在一次改写中直接嵌套。
     for group in groups.into_values().rev() {
-        let keep_label =
-            label_refs.get(&group.label).copied().unwrap_or_default() > group.candidates.len();
+        let keep_label = group.label_index < stmts.len()
+            && label_refs.get(&group.label).copied().unwrap_or_default() > group.candidates.len();
         rewrite_fold_group(stmts, group, kind, keep_label);
     }
     true
@@ -645,7 +810,8 @@ fn rewrite_fold_group(
     if keep_label {
         nested.push(stmts[group.label_index].clone());
     }
-    stmts.splice(first..=group.label_index, nested);
+    let end = (group.label_index + 1).min(stmts.len());
+    stmts.splice(first..end, nested);
 }
 
 fn rewrite_if(mut if_stmt: HirIf, body: Vec<HirStmt>, kind: FoldKind, invert_cond: bool) -> HirIf {
@@ -705,13 +871,22 @@ fn can_move_into_branch(stmts: &[HirStmt], kind: FoldKind) -> bool {
     // `if cond then goto A end; goto B; ::A::` 是 island 常见的双向 guard。
     // 把唯一的备用 goto 收进反向 arm 不改变 transfer，只减少一层壳；最终 AST
     // scope verifier 仍负责确认目标 label 对嵌套 arm 可见且没有跳进 local/TBC。
-    if matches!(kind, FoldKind::Guard) && matches!(stmts, [HirStmt::Goto(_)]) {
-        return true;
-    }
+    // guard 的正文可以在最后执行另一条 transfer；它仍只在同一条件下执行一次。
+    // 只允许尾部 goto，不能把中途跳过的语句误当作正常顺序正文。
+    let stmts = if matches!(kind, FoldKind::Guard) && matches!(stmts.last(), Some(HirStmt::Goto(_)))
+    {
+        &stmts[..stmts.len() - 1]
+    } else {
+        stmts
+    };
     stmts.iter().all(|stmt| {
         !matches!(
             stmt,
-            HirStmt::LocalDecl(_) | HirStmt::Goto(_) | HirStmt::Label(_)
+            HirStmt::LocalDecl(_)
+                | HirStmt::Goto(_)
+                | HirStmt::Label(_)
+                | HirStmt::ToBeClosed(_)
+                | HirStmt::Close(_)
         )
     })
 }

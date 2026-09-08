@@ -236,8 +236,19 @@ pub(super) fn validate_region_entries(
                     })
                     .count();
                 if boundary.entry_count != through_entry {
+                    let incoming = cfg
+                        .edges
+                        .iter()
+                        .filter(|edge| {
+                            edge.to != *entry
+                                && cfg.reachable_blocks.contains(&edge.from)
+                                && !region_contains_block(plan, intervals, region_id, edge.from)
+                                && region_contains_block(plan, intervals, region_id, edge.to)
+                        })
+                        .map(|edge| format!("{} -> {}", edge.from, edge.to))
+                        .collect::<Vec<_>>();
                     return Err(StructureError::invalid(format!(
-                        "structured region #{index} has a non-entry incoming edge"
+                        "structured region #{index} has a non-entry incoming edge: entry={entry}, incoming={incoming:?}"
                     )));
                 }
             }

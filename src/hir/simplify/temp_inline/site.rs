@@ -5,6 +5,8 @@
 //! test 当作必达 condition；其它节点和 target 仍是条件执行的 nested site。method 协议
 //! 已经证明 callee base 与隐式首参是同一次 receiver 求值，因此这里把这两个结构引用
 //! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
+//! 单次 predicate 内普通 call 及其直接 call 参数的 callee 保留有界控制头站点；可观察前缀证明仍拒绝
+//! 短路右支或更早求值事件，循环头、method 与 FASTCALL 不借此扩大协议。
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
 use super::super::decision::decision_has_cycles;
@@ -419,6 +421,8 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
         } else {
             InlineSite::CallCallee
         }
+    } else if site == InlineSite::Condition && !call.method && call.fastcall.is_none() {
+        InlineSite::ConditionCallee
     } else {
         InlineSite::Nested
     };
@@ -441,7 +445,20 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
                 }
             })
         } else {
-            find_site_in_exprs(&call.args, temp, InlineSite::CallArg)
+            call.args.iter().find_map(|arg| {
+                // `check(object.read())` 的内层 callee 仍属于同一次 predicate；
+                // 参数本身继续走 CallArg 预算，求值前缀证明负责拒绝跨越外层 lookup。
+                if site == InlineSite::Condition
+                    && !call.method
+                    && let HirExpr::Call(nested) = arg
+                    && !nested.method
+                    && nested.fastcall.is_none()
+                {
+                    find_site_in_call(nested, temp, InlineSite::Condition)
+                } else {
+                    find_site_in_expr(arg, temp, InlineSite::CallArg)
+                }
+            })
         }
     })
 }
@@ -581,6 +598,7 @@ fn find_site_in_decision(
             | InlineSite::FastCallArg
             | InlineSite::CallCallee
             | InlineSite::FastCallCallee
+            | InlineSite::ConditionCallee
             | InlineSite::AccessBase => InlineSite::Nested,
         }
     };
@@ -707,6 +725,7 @@ pub(super) enum InlineSite {
     FastCallArg,
     CallCallee,
     FastCallCallee,
+    ConditionCallee,
     AccessBase,
     Condition,
     LoopCondition,
@@ -718,6 +737,10 @@ impl InlineSite {
         match self {
             Self::Direct => true,
             Self::CallCallee | Self::FastCallCallee => true,
+            Self::ConditionCallee => {
+                !matches!(replacement, HirExpr::Closure(_))
+                    && expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
+            }
             Self::Nested => {
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && is_small_pure_nested_inline_expr(replacement)
@@ -750,6 +773,7 @@ impl InlineSite {
             | Self::Nested
             | Self::CallCallee
             | Self::FastCallCallee
+            | Self::ConditionCallee
             | Self::Condition
             | Self::LoopCondition
             | Self::LoopHead => None,
@@ -771,6 +795,7 @@ impl InlineSite {
             | Self::FastCallArg
             | Self::CallCallee
             | Self::FastCallCallee
+            | Self::ConditionCallee
             | Self::AccessBase
             | Self::Condition
             | Self::LoopCondition
@@ -797,12 +822,16 @@ impl InlineSite {
             | Self::FastCallArg
             | Self::CallCallee
             | Self::FastCallCallee
+            | Self::ConditionCallee
             | Self::AccessBase => Self::Nested,
         }
     }
 
     pub(super) const fn is_call_callee(self) -> bool {
-        matches!(self, Self::CallCallee | Self::FastCallCallee)
+        matches!(
+            self,
+            Self::CallCallee | Self::FastCallCallee | Self::ConditionCallee
+        )
     }
 }
 

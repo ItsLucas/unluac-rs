@@ -1,3 +1,8 @@
+//! 最终 containment 与正常完成性的共享索引，只消费冻结 region 的有序 children/layout。
+//! 包含关系不等于可自然完成：`if a then early end; tail` 中的 early 不能跳过 tail 后
+//! 被当成外层 fallthrough。非尾 sequence/island child 形成前缀屏障，查询保持 O(1)；
+//! 这里只提供导航事实，不重选 branch/loop，不把越过屏障的 CFG transfer 静默删除。
+
 use crate::structure::{BlockRef, Cfg, EdgeRef, StructurePlan};
 
 use super::{RegionId, RegionPlan, StructureError, UnstructuredLayoutItem};
@@ -55,6 +60,7 @@ pub struct RegionNavigation {
     boundaries: Vec<RegionBoundarySummary>,
     has_unstructured_ancestor: Vec<bool>,
     island_completion: Vec<IslandCompletion>,
+    completion_barrier_prefix: Vec<usize>,
 }
 
 impl RegionNavigation {
@@ -152,14 +158,55 @@ impl RegionNavigation {
             boundaries: vec![RegionBoundarySummary::default(); regions.len()],
             has_unstructured_ancestor: vec![false; regions.len()],
             island_completion: vec![IslandCompletion::None; regions.len()],
+            completion_barrier_prefix: vec![0; regions.len()],
         };
         navigation.freeze_region_facts(regions)?;
         navigation.freeze_edges_and_boundaries(cfg, region_by_block, &children)?;
         Ok(navigation)
     }
 
-    fn freeze_region_facts(&mut self, regions: &[RegionPlan]) -> Result<(), StructureError> {
+    /// containment 不变而 layout 排序完成后，需要重新冻结依赖 child 顺序的完成性事实。
+    pub(super) fn freeze_region_facts(
+        &mut self,
+        regions: &[RegionPlan],
+    ) -> Result<(), StructureError> {
+        let mut non_tail_child = vec![false; regions.len()];
+        let mut condition_region = vec![false; regions.len()];
+        // condition 的 blocks 由冻结 DAG 有条件地执行，不是源码顺序语句列表。
+        for region in regions {
+            if let RegionPlan::Branch { condition, .. } = region {
+                condition_region[condition.index()] = true;
+            }
+        }
+        for (index, region) in regions.iter().enumerate() {
+            match region {
+                RegionPlan::Sequence { children, .. } if !condition_region[index] => {
+                    if let Some((_, prefix)) = children.split_last() {
+                        for child in prefix {
+                            non_tail_child[child.index()] = true;
+                        }
+                    }
+                }
+                RegionPlan::Unstructured { layout, .. } => {
+                    if let Some((_, prefix)) = layout.split_last() {
+                        for item in prefix {
+                            if let UnstructuredLayoutItem::Region(child) = item {
+                                non_tail_child[child.index()] = true;
+                            }
+                        }
+                    }
+                }
+                RegionPlan::Block { .. }
+                | RegionPlan::Sequence { .. }
+                | RegionPlan::Branch { .. }
+                | RegionPlan::ValueDecision { .. }
+                | RegionPlan::Loop { .. } => {}
+            }
+        }
         for region in &self.preorder {
+            self.completion_barrier_prefix[region.index()] = self.parent[region.index()]
+                .map_or(0, |parent| self.completion_barrier_prefix[parent.index()])
+                + usize::from(non_tail_child[region.index()]);
             let inherited = self.parent[region.index()]
                 .is_some_and(|parent| self.has_unstructured_ancestor[parent.index()]);
             let current = matches!(
@@ -513,11 +560,25 @@ impl RegionNavigation {
 
     pub(super) fn region_can_complete_from(
         &self,
-        island: RegionId,
+        region: RegionId,
         source_owner: RegionId,
         source_block: BlockRef,
     ) -> bool {
-        match self.island_completion.get(island.index()).copied() {
+        self.completion_barrier_prefix
+            .get(region.index())
+            .zip(self.completion_barrier_prefix.get(source_owner.index()))
+            .is_some_and(|(region, source)| region == source)
+            && self.layout_tail_contains(region, source_owner, source_block)
+            && self.layout_tail_contains(source_owner, source_owner, source_block)
+    }
+
+    fn layout_tail_contains(
+        &self,
+        region: RegionId,
+        source_owner: RegionId,
+        source_block: BlockRef,
+    ) -> bool {
+        match self.island_completion.get(region.index()).copied() {
             Some(IslandCompletion::ExactBlock { owner, block }) => {
                 source_owner == owner && source_block == block
             }

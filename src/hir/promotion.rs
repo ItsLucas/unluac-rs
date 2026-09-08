@@ -244,6 +244,13 @@ impl HomeSlotKey {
     pub(super) const fn new(slot: usize, epoch: usize) -> Self {
         Self { slot, epoch }
     }
+
+    /// 只在同一 close epoch 内比较物理布局，不能把相邻寄存器的不同词法身份合并。
+    pub(super) fn offset_from(self, base: Self) -> Option<usize> {
+        (self.epoch == base.epoch)
+            .then(|| self.slot.checked_sub(base.slot))
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

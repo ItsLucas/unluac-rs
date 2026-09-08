@@ -1,4 +1,6 @@
-//! 汇总冻结最终 StructurePlan 所需的候选与边界；依赖各专题选择结果，不负责构建区域 arena；例如为 branch、loop 和 condition 建立稳定输入。
+//! 汇总冻结最终 StructurePlan 所需的候选与边界；依赖各专题选择结果，不负责构建区域 arena。
+//! 短路出口只有在另一臂的正常路径唯一汇入它时才能成为单臂 continuation；
+//! 例如 `(a or b) and c` 的两臂另有共同尾部时，保留 if/else，不能把其中一臂当作尾部。
 
 use super::*;
 
@@ -144,7 +146,9 @@ pub(super) fn normalize_branch_condition_boundary(
         branch.invert_hint = false;
         return true;
     }
-    if let Some((then_entry, continuation)) = branch_endpoint_boundary(graph_facts, truthy, falsy) {
+    if let Some((then_entry, continuation)) =
+        branch_endpoint_boundary(cfg, graph_facts, loops, truthy, falsy)
+    {
         branch.then_entry = then_entry;
         branch.else_entry = None;
         branch.merge = Some(continuation);
@@ -174,18 +178,34 @@ pub(super) fn normalize_branch_condition_boundary(
 }
 
 pub(super) fn branch_endpoint_boundary(
+    cfg: &Cfg,
     graph_facts: &GraphFacts,
+    loops: &[LoopCandidate],
     truthy: super::super::BlockRef,
     falsy: super::super::BlockRef,
 ) -> Option<(super::super::BlockRef, super::super::BlockRef)> {
-    let truthy_joins_falsy = graph_facts
-        .dominance_frontier
-        .get(truthy.index())
-        .is_some_and(|frontier| frontier.contains(&falsy));
-    let falsy_joins_truthy = graph_facts
-        .dominance_frontier
-        .get(falsy.index())
-        .is_some_and(|frontier| frontier.contains(&truthy));
+    // frontier 只证明某条路径汇入出口，不证明所有本轮正常路径都汇入它。第二个汇入点
+    // 必须留在分支之外；函数出口、共同 loop owner 的退出以及回边不属于本轮 continuation。
+    let joins_only_at = |from, target| {
+        let mut frontier = graph_facts.dominance_frontier_blocks(from).filter(|block| {
+            *block != cfg.exit_block
+                && (*block == target
+                    || ((!graph_facts.loop_headers.contains(block)
+                        || !graph_facts.dominates(*block, from))
+                        && !loops.iter().any(|loop_| {
+                            loop_.blocks.contains(&from)
+                                && loop_.blocks.contains(&target)
+                                && loop_.exits.iter().any(|exit| {
+                                    exit == block
+                                        || branches::transparent_jump_target(cfg, *exit)
+                                            == Some(*block)
+                                })
+                        })))
+        });
+        frontier.next() == Some(target) && frontier.next().is_none()
+    };
+    let truthy_joins_falsy = joins_only_at(truthy, falsy);
+    let falsy_joins_truthy = joins_only_at(falsy, truthy);
     match (truthy_joins_falsy, falsy_joins_truthy) {
         (true, false) => Some((truthy, falsy)),
         (false, true) => Some((falsy, truthy)),
