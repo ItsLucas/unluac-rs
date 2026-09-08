@@ -1,4 +1,4 @@
-//! Canonical effectful array regions; wire this slice into case_manifest.rs.
+//! Canonical effectful array regions.
 use super::*;
 
 pub(super) const REGRESSION_CASES_397: &[LuaCaseMatrixEntry] = &[
