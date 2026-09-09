@@ -3,7 +3,8 @@
 //! String keys outside Lua 5.1's RK range occupy the first scratch slot; values
 //! then start one slot higher. Constant provenance distinguishes these keys from
 //! runtime values, including LOADBOOL/LOADNIL once the pool exceeds RK capacity.
-//! Numeric keys, calls, and nested record values remain excluded.
+//! Fixed calls with literal arguments retain their callee and result stack slot.
+//! Numeric keys, open calls, and nested record values remain excluded.
 
 use std::collections::BTreeSet;
 
@@ -61,6 +62,75 @@ fn reaches_rk_limit(instr: &LowInstr) -> bool {
 }
 
 impl ArrayParser<'_, '_> {
+    fn fixed_record_call(&mut self, owner: Reg, values: &[RecordSlot]) -> Option<(HirExpr, bool)> {
+        if !values.is_empty() && !matches!(values, [key] if key.is_large_string()) {
+            return None;
+        }
+        let LowInstr::GetTable(get) = *self.instruction()? else {
+            return None;
+        };
+        if get.kind != GetTableKind::Normal
+            || get.base != AccessBase::Env
+            || !matches!(get.key, AccessKey::Const(_))
+            || get.dst.index() != owner.index() + values.len() + 1
+        {
+            return None;
+        }
+        let callee = self.scalar_value()?;
+        let mut parser = self.clone();
+        let mut full_pool = reaches_rk_limit(parser.instruction()?);
+        parser.cursor += 1;
+        let mut args = Vec::new();
+        while let LowInstr::LoadConst(load) = *parser.instruction()? {
+            if load.dst.index() != get.dst.index() + args.len() + 1 {
+                return None;
+            }
+            let value = expr_for_const(parser.lowering.proto, load.value);
+            if !matches!(
+                value,
+                HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+            ) {
+                return None;
+            }
+            args.push(value);
+            full_pool |= reaches_rk_limit(parser.instruction()?);
+            parser.cursor += 1;
+        }
+        let LowInstr::Call(call) = *parser.instruction()? else {
+            return None;
+        };
+        if call.kind != CallKind::Normal
+            || call.method_name.is_some()
+            || call.callee != get.dst
+            || !matches!(call.args, ValuePack::Fixed(arguments)
+                if arguments.start.index() == get.dst.index() + 1 && arguments.len == args.len())
+            || !matches!(call.results, ResultPack::Fixed(results)
+                if results.start == get.dst && results.len == 1)
+        {
+            return None;
+        }
+        parser.cursor += 1;
+        if !matches!(parser.instruction()?, LowInstr::SetTable(store)
+            if store.kind == SetTableKind::Normal
+                && store.base == AccessBase::Reg(owner)
+                && store.value == ValueOperand::Reg(get.dst))
+        {
+            return None;
+        }
+        self.cursor = parser.cursor;
+        self.has_observable_producer = true;
+        Some((
+            HirExpr::Call(Box::new(HirCallExpr {
+                callee,
+                args: args.into(),
+                method: false,
+                fastcall: None,
+                method_name: None,
+            })),
+            full_pool,
+        ))
+    }
+
     fn materialized_primitive_store(
         &self,
         owner: Reg,
@@ -108,6 +178,11 @@ impl ArrayParser<'_, '_> {
             .any(reaches_rk_limit);
         self.cursor += 1;
         loop {
+            if let Some((call, call_fills_pool)) = self.fixed_record_call(seed.dst, &values) {
+                values.push(RecordSlot::computed(call));
+                full_pool |= call_fills_pool;
+                continue;
+            }
             let instruction = self.instruction()?.clone();
             let reaches_limit = reaches_rk_limit(&instruction);
             match instruction {

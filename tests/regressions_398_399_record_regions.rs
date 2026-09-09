@@ -11,6 +11,9 @@ use unluac::decompile::{
 use unluac::parser::RawLiteralConst;
 use unluac::transformer::{AccessBase, AccessKey, LowInstr, LoweredProto, ValueOperand};
 
+#[path = "support/module_array_regions.rs"]
+mod module_array_regions;
+
 fn options(mode: NamingMode) -> DecompileOptions {
     let mut options = DecompileOptions::default();
     options.generate.mode = GenerateMode::Strict;
@@ -64,6 +67,14 @@ fn builder(proto: &LoweredProto) -> &LoweredProto {
 }
 
 fn assert_roundtrip(workspace: &Workspace, source: &str) {
+    assert_roundtrip_trace(workspace, source, prefix_and_region);
+}
+
+fn assert_roundtrip_trace(
+    workspace: &Workspace,
+    source: &str,
+    trace: fn(&LoweredProto) -> Option<&[LowInstr]>,
+) {
     let expected = with_stdin(Command::new(tool("lua")).arg("-"), source).stdout;
     for strip in [true, false] {
         let bytes = compile(workspace, source, strip);
@@ -90,8 +101,8 @@ fn assert_roundtrip(workspace: &Workspace, source: &str) {
             let before = builder(&before.main);
             let after = builder(&after.main);
             assert_eq!(
-                prefix_and_region(before),
-                prefix_and_region(after),
+                trace(before),
+                trace(after),
                 "including ignored-call prefix, all physical writes must match"
             );
             let before = &before.constants.common.literals;
@@ -754,6 +765,11 @@ fn regressions_416_primitive_gc_and_captured_roots() {
 }
 
 fn assert_rejected_record_word(bytes: &[u8], offset: usize, word: u32) {
+    let error = rejected_record_word(bytes, offset, word);
+    assert!(error.contains("residual table-set-list"), "{error}");
+}
+
+fn rejected_record_word(bytes: &[u8], offset: usize, word: u32) -> String {
     let encoded = if bytes[6] == 1 {
         word.to_le_bytes()
     } else {
@@ -761,12 +777,9 @@ fn assert_rejected_record_word(bytes: &[u8], offset: usize, word: u32) {
     };
     let mut changed = bytes.to_vec();
     changed[offset..offset + 4].copy_from_slice(&encoded);
-    let error = decompile(&changed, options(NamingMode::Simple))
-        .expect_err("noncanonical primitive materialization must stay rejected");
-    assert!(
-        error.to_string().contains("residual table-set-list"),
-        "{error}"
-    );
+    decompile(&changed, options(NamingMode::Simple))
+        .expect_err("noncanonical record bytecode must stay rejected")
+        .to_string()
 }
 
 #[test]

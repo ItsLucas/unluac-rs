@@ -9,7 +9,8 @@
 //! The entry prefix must also keep the register frame anchored: calls either discard
 //! all results or declare locals with multiple later reads. An unread prefix root
 //! could otherwise disappear during cleanup and change indirect-GC observations.
-//! Record-only children additionally preserve each string-key write and lookup chain.
+//! Closed global constructors can extend that prefix without retaining stack locals.
+//! Record-only children preserve each string-key write, lookup chain and fixed call.
 
 mod captured;
 mod open_tail;
@@ -52,10 +53,15 @@ pub(super) fn recover_canonical_arrays(body: &mut HirBlock, lowering: &ProtoLowe
         return;
     }
     let mut index = 0;
+    let mut closed_arrays = Vec::new();
     while index < body.stmts.len() {
-        let Some((replacement, count)) = global_array_region(&body.stmts[index..], lowering)
-            .or_else(|| captured::captured_array_region(&body.stmts[index..], lowering))
-        else {
+        let recovered = global_array_region(&body.stmts[index..], lowering, &closed_arrays)
+            .map(|(replacement, count, region)| {
+                closed_arrays.push(region);
+                (replacement, count)
+            })
+            .or_else(|| captured::captured_array_region(&body.stmts[index..], lowering));
+        let Some((replacement, count)) = recovered else {
             index += 1;
             continue;
         };
@@ -64,10 +70,17 @@ pub(super) fn recover_canonical_arrays(body: &mut HirBlock, lowering: &ProtoLowe
     }
 }
 
+struct ClosedArrayRegion {
+    start: usize,
+    end: usize,
+    root: Reg,
+}
+
 fn global_array_region(
     stmts: &[HirStmt],
     lowering: &ProtoLowering<'_>,
-) -> Option<(HirStmt, usize)> {
+    closed_arrays: &[ClosedArrayRegion],
+) -> Option<(HirStmt, usize, ClosedArrayRegion)> {
     let HirStmt::Assign(seed) = stmts.first()? else {
         return None;
     };
@@ -89,12 +102,13 @@ fn global_array_region(
     let LowInstr::NewTable(new_table) = lowering.proto.instrs.get(start)? else {
         return None;
     };
-    if !canonical_prefix_keeps_frame(
+    if !prefix_with_closed_arrays(
         lowering.proto,
         lowering.cfg,
         lowering.dataflow,
         start,
         new_table.dst,
+        closed_arrays,
     ) {
         return None;
     }
@@ -108,9 +122,6 @@ fn global_array_region(
         allow_open_tail: false,
     };
     let expression = parser.table(0)?;
-    if !parser.has_observable_producer {
-        return None;
-    }
     let end = parser.cursor;
     let LowInstr::SetTable(store) = parser.instruction()? else {
         return None;
@@ -160,7 +171,15 @@ fn global_array_region(
         return None;
     };
     store.values = vec![expression].into();
-    Some((replacement, expected.len()))
+    Some((
+        replacement,
+        expected.len(),
+        ClosedArrayRegion {
+            start,
+            end: end + 1,
+            root: new_table.dst,
+        },
+    ))
 }
 
 fn canonical_prefix_keeps_frame(
@@ -169,6 +188,17 @@ fn canonical_prefix_keeps_frame(
     dataflow: &DataflowFacts,
     end: usize,
     root: Reg,
+) -> bool {
+    prefix_with_closed_arrays(proto, cfg, dataflow, end, root, &[])
+}
+
+fn prefix_with_closed_arrays(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    end: usize,
+    root: Reg,
+    closed_arrays: &[ClosedArrayRegion],
 ) -> bool {
     if proto.signature.has_vararg_param_reg
         || cfg.instr_to_block[..=end]
@@ -180,6 +210,15 @@ fn canonical_prefix_keeps_frame(
     let mut slot = usize::from(proto.signature.num_params);
     let mut pc = 0;
     while pc < end {
+        // Only a previously replaced, whole NEWTABLE..SETGLOBAL transaction can
+        // bridge a prefix. Unknown statements and surviving locals are not skipped.
+        if let Some(region) = closed_arrays.iter().find(|region| region.start == pc) {
+            if region.root.index() != slot || region.end > end {
+                return false;
+            }
+            pc = region.end;
+            continue;
+        }
         // A primitive local captured by a later closure must retain a stack slot.
         // Do not admit unread constants: cleanup could erase their declaration.
         if let Some(LowInstr::LoadConst(load)) = proto.instrs.get(pc)
@@ -260,6 +299,7 @@ fn canonical_prefix_keeps_frame(
     pc == end && slot == root.index()
 }
 
+#[derive(Clone)]
 struct ArrayParser<'a, 'b> {
     lowering: &'a ProtoLowering<'b>,
     block: BlockRef,
