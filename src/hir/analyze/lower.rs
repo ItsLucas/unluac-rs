@@ -1140,7 +1140,7 @@ fn build_proto_body(
     lowering: &ProtoLowering<'_>,
 ) -> Result<HirBlock, HirLowerError> {
     let mut body = build_structured_body(proto, lowering)?;
-    super::array_constructor_regions::recover_global_arrays(&mut body, lowering);
+    super::array_constructor_regions::recover_canonical_arrays(&mut body, lowering);
     let mut prefix = if lowering.bindings.debug_entry_local_decls.is_empty() {
         Vec::new()
     } else {

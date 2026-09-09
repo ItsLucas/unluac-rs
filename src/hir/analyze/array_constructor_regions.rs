@@ -3,13 +3,16 @@
 //! This is not the generic SETLIST folding rule. A complete, single-block expression
 //! must reproduce the compiler's register stack, fixed CALL results, CONCAT ranges,
 //! allocation operands and 50-field flushes. Its only escaping value is installed by
-//! the immediately following SETGLOBAL. No seed, scratch assignment or field write
-//! may survive independently, and the global store stays after every RHS effect.
+//! the immediately following SETGLOBAL or retains its existing captured-root binding.
+//! No scratch assignment or field write may survive independently; global stores
+//! and closure creation stay after every RHS effect.
 //! The entry prefix must also keep the register frame anchored: calls either discard
 //! all results or declare locals with multiple later reads. An unread prefix root
 //! could otherwise disappear during cleanup and change indirect-GC observations.
 //! Record-only children additionally preserve each string-key write and lookup chain.
 
+mod captured;
+mod open_tail;
 mod records;
 
 use super::exprs::expr_for_const;
@@ -39,7 +42,7 @@ mod regressions_397;
 #[path = "array_constructor_regions/regressions_398.rs"]
 mod regressions_398;
 
-pub(super) fn recover_global_arrays(body: &mut HirBlock, lowering: &ProtoLowering<'_>) {
+pub(super) fn recover_canonical_arrays(body: &mut HirBlock, lowering: &ProtoLowering<'_>) {
     if lowering.target.version != DecompileDialect::Lua51
         || body
             .stmts
@@ -50,7 +53,9 @@ pub(super) fn recover_global_arrays(body: &mut HirBlock, lowering: &ProtoLowerin
     }
     let mut index = 0;
     while index < body.stmts.len() {
-        let Some((replacement, count)) = global_array_region(&body.stmts[index..], lowering) else {
+        let Some((replacement, count)) = global_array_region(&body.stmts[index..], lowering)
+            .or_else(|| captured::captured_array_region(&body.stmts[index..], lowering))
+        else {
             index += 1;
             continue;
         };
@@ -100,6 +105,7 @@ fn global_array_region(
         start,
         cursor: start,
         has_observable_producer: false,
+        allow_open_tail: false,
     };
     let expression = parser.table(0)?;
     if !parser.has_observable_producer {
@@ -174,6 +180,22 @@ fn canonical_prefix_keeps_frame(
     let mut slot = usize::from(proto.signature.num_params);
     let mut pc = 0;
     while pc < end {
+        // A primitive local captured by a later closure must retain a stack slot.
+        // Do not admit unread constants: cleanup could erase their declaration.
+        if let Some(LowInstr::LoadConst(load)) = proto.instrs.get(pc)
+            && load.dst.index() == slot
+            && dataflow.instr_defs[pc].len() == 1
+            && dataflow.def_uses[dataflow.instr_defs[pc][0].index()].iter().any(|site| {
+                site.instr.index() >= end
+                    && matches!(&proto.instrs[site.instr.index()], LowInstr::Closure(closure)
+                        if closure.captures.iter().any(|capture|
+                            capture.source == crate::transformer::CaptureSource::ByReference(load.dst)))
+            })
+        {
+            slot += 1;
+            pc += 1;
+            continue;
+        }
         if !matches!(proto.instrs.get(pc),
             Some(LowInstr::GetTable(get))
                 if get.dst.index() == slot
@@ -245,6 +267,7 @@ struct ArrayParser<'a, 'b> {
     start: usize,
     cursor: usize,
     has_observable_producer: bool,
+    allow_open_tail: bool,
 }
 
 impl ArrayParser<'_, '_> {
@@ -332,6 +355,12 @@ impl ArrayParser<'_, '_> {
                 LowInstr::Call(call)
                     if call.kind == CallKind::Normal && call.method_name.is_none() =>
                 {
+                    if depth == 0
+                        && self.allow_open_tail
+                        && matches!(call.results, ResultPack::Open(_))
+                    {
+                        return self.open_tail(seed, fields, pending, call);
+                    }
                     let ValuePack::Fixed(args) = call.args else {
                         return None;
                     };
@@ -410,9 +439,11 @@ impl ArrayParser<'_, '_> {
                     }
                     if depth == 0
                         && allocation == Lua51TableAllocation::from_field_counts(fields.len(), 0)
-                        && matches!(self.instruction()?, LowInstr::SetTable(store)
+                        && (matches!(self.instruction()?, LowInstr::SetTable(store)
                             if store.base == AccessBase::Env
                                 && store.value == ValueOperand::Reg(seed.dst))
+                            || matches!(self.instruction()?, LowInstr::Closure(closure)
+                                if closure.dst.index() == base + 1))
                     {
                         return Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
                             fields,
