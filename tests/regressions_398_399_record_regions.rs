@@ -698,3 +698,179 @@ fn regressions_415_large_keys_preserve_gc_scratch_roots() {
         .replace("    Record399Load()", &calls);
     assert_roundtrip(&workspace, &source);
 }
+
+#[test]
+fn regressions_416_primitive_fields_and_reused_keys() {
+    let workspace = Workspace::new();
+    assert_roundtrip(
+        &workspace,
+        include_str!("regress-case/regress_416_primitive_record_values.lua"),
+    );
+}
+
+#[test]
+fn regressions_416_primitive_pool_boundaries() {
+    let workspace = Workspace::new();
+    for prefix in [240, 248, 250, 252, 254, 256, 270] {
+        for value in ["true", "false", "nil", "3"] {
+            for reuse_key in [false, true] {
+                let mut source = source_with_large_constant_pool(prefix)
+                    .replace("pad = 3", &format!("pad = {value}"));
+                if reuse_key {
+                    source = source.replace(
+                        "Record398Load(3)",
+                        "Record398Load(\"pad\")\n Record398Load(3)",
+                    );
+                }
+                source.push_str(&format!(
+                    "\nassert(Record398Rows[1].pad == {value} and Record398Rows[2].pad == {value})\n"
+                ));
+                assert_roundtrip(&workspace, &source);
+            }
+        }
+    }
+}
+
+#[test]
+fn regressions_416_primitive_gc_and_captured_roots() {
+    let workspace = Workspace::new();
+    let mut calls = "Record399Load(\"padding\")\n".to_owned();
+    for n in 0..270 {
+        writeln!(calls, "Record399Load(\"pool416_{n}\")").unwrap();
+    }
+    for value in ["true", "false", "nil"] {
+        let source = include_str!("regress-case/regress_399_record_lookup_gc.lua")
+            .replace("    Record399Load()", &calls)
+            .replace("padding = 0", &format!("padding = {value}"));
+        assert_roundtrip(&workspace, &source);
+        let captured = source
+                    .replace("Record399Rows = {", "local rows = {")
+                    .replace(
+                        "    }\nend",
+                        "    }\n    function Record416Read() return rows end\n    Record399Rows = rows\nend",
+                    );
+        assert_roundtrip(&workspace, &captured);
+    }
+}
+
+fn assert_rejected_record_word(bytes: &[u8], offset: usize, word: u32) {
+    let encoded = if bytes[6] == 1 {
+        word.to_le_bytes()
+    } else {
+        word.to_be_bytes()
+    };
+    let mut changed = bytes.to_vec();
+    changed[offset..offset + 4].copy_from_slice(&encoded);
+    let error = decompile(&changed, options(NamingMode::Simple))
+        .expect_err("noncanonical primitive materialization must stay rejected");
+    assert!(
+        error.to_string().contains("residual table-set-list"),
+        "{error}"
+    );
+}
+
+#[test]
+fn regressions_416_future_constants_do_not_prove_materialization() {
+    let workspace = Workspace::new();
+    let mut suffix = String::new();
+    for n in 0..270 {
+        writeln!(suffix, "Record398Load(\"later416_{n}\")").unwrap();
+    }
+    let source = source_with_large_constant_pool(0)
+        .replace("pad = 3", "pad = Record416Value")
+        .replace(
+            "-- region398 rows end\n    }",
+            &format!("-- region398 rows end\n    }}\n{suffix}"),
+        );
+    for strip in [true, false] {
+        let bytes = compile(&workspace, &source, strip);
+        let result = decompile(&bytes, options(NamingMode::Simple)).unwrap();
+        let lowered = result.state.lowered.unwrap();
+        let index = lowered
+            .main
+            .children
+            .iter()
+            .position(|proto| prefix_and_region(proto).is_some())
+            .unwrap();
+        let proto = &lowered.main.children[index];
+        let constants = &proto.constants.common.literals;
+        assert!(constants.len() > 256);
+        let (pc, dst) = proto
+            .instrs
+            .iter()
+            .enumerate()
+            .find_map(|(pc, instr)| match instr {
+                LowInstr::GetTable(get) if get.base == AccessBase::Env => {
+                    let AccessKey::Const(key) = get.key else {
+                        return None;
+                    };
+                    matches!(&constants[key.index()], RawLiteralConst::String(value)
+                                if value.bytes.as_ref() == b"Record416Value")
+                    .then_some((pc, get.dst.index() as u32))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let number = constants
+            .iter()
+            .position(
+                |constant| matches!(constant, RawLiteralConst::Number(value) if *value == 3.0),
+            )
+            .unwrap() as u32;
+        assert!(number < 255);
+        let raw = result.state.raw_chunk.unwrap();
+        let origin = raw.main.common.children[index].common.instructions[pc].origin;
+        for word in [
+            2 | (dst << 6) | (1 << 23),      // LOADBOOL true
+            2 | (dst << 6),                  // LOADBOOL false
+            3 | (dst << 6) | (dst << 23),    // LOADNIL, one slot
+            1 | (dst << 6) | (number << 14), // LOADK, reused numeric literal
+        ] {
+            assert_rejected_record_word(&bytes, origin.span.offset, word);
+        }
+    }
+}
+
+#[test]
+fn regressions_416_wrong_primitive_slots_and_skip_stay_rejected() {
+    let workspace = Workspace::new();
+    for strip in [true, false] {
+        let bytes = compile(
+            &workspace,
+            include_str!("regress-case/regress_416_primitive_record_values.lua"),
+            strip,
+        );
+        let result = decompile(&bytes, options(NamingMode::Simple)).unwrap();
+        let lowered = result.state.lowered.unwrap();
+        let index = lowered
+            .main
+            .children
+            .iter()
+            .position(|proto| prefix_and_region(proto).is_some())
+            .unwrap();
+        let proto = &lowered.main.children[index];
+        let bool_pc = proto
+            .instrs
+            .iter()
+            .position(|instr| matches!(instr, LowInstr::LoadBool(_)))
+            .unwrap();
+        let nil_pc = proto
+            .instrs
+            .iter()
+            .position(|instr| matches!(instr, LowInstr::LoadNil(_)))
+            .unwrap();
+        let raw = result.state.raw_chunk.unwrap();
+        let instructions = &raw.main.common.children[index].common.instructions;
+        let boolean = instructions[bool_pc].origin;
+        let nil = instructions[nil_pc].origin;
+        let bool_word = u32::try_from(boolean.raw_word.unwrap()).unwrap();
+        let nil_word = u32::try_from(nil.raw_word.unwrap()).unwrap();
+        for (origin, word) in [
+            (boolean, bool_word + (1 << 6)),  // shift the boolean destination
+            (boolean, bool_word | (1 << 14)), // LOADBOOL must not skip its field store
+            (nil, nil_word + (1 << 23)),      // clearing another slot changes the scratch trace
+        ] {
+            assert_rejected_record_word(&bytes, origin.span.offset, word);
+        }
+    }
+}
