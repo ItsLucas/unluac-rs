@@ -106,6 +106,7 @@ impl<'a> AstLowerer<'a> {
         }
         Ok(AstFunctionExpr {
             function: closure.proto,
+            source_frame: child.source_frame.is_some(),
             params: child.params.clone(),
             is_vararg: child.signature.is_vararg,
             named_vararg,
@@ -217,6 +218,7 @@ impl<'a> AstLowerer<'a> {
                 expr: self.lower_expr(proto_index, &unary.expr)?,
             })),
             HirExpr::Binary(binary) => AstExpr::Binary(Box::new(AstBinaryExpr {
+                operand_order: binary.operand_order,
                 op: lower_binary_op(binary.op),
                 lhs: self.lower_expr(proto_index, &binary.lhs)?,
                 rhs: self.lower_expr(proto_index, &binary.rhs)?,

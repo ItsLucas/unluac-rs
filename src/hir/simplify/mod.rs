@@ -4,6 +4,8 @@
 //! 负责声明 simplify 子模块并暴露主入口；真正的 pass 实现都放在目录内部。这样
 //! `src/hir` 下两条主线在结构上保持一致，后续维护时更不容易产生“哪边是入口、哪边
 //! 是细节实现”的混淆。
+//! 已取得完整源码帧证书的 proto 不进入后处理：例如内联一次使用的 local 或交换分支
+//! 都可能改变寄存器旧值的 GC 生命周期。未认证的子函数仍独立执行正常后处理。
 
 mod boolean_shells;
 mod branch_control_folding;
@@ -261,6 +263,9 @@ pub(super) fn simplify_hir(
                     );
                 }
                 apply_proto_pass(module, |proto| {
+                    if proto.source_frame.is_some() {
+                        return false;
+                    }
                     let facts = promotion_facts
                         .get_mut(proto.id.index())
                         .unwrap_or(&mut empty_facts);
@@ -348,13 +353,15 @@ fn apply_temp_inline_pass(
         let proto_id = module.protos[proto_index].id.index();
         let facts = promotion_facts.get(proto_id).unwrap_or(empty_facts);
         let proto = &mut module.protos[proto_index];
-        changed |= temp_inline::inline_temps_in_proto_with_facts(
-            proto,
-            readability,
-            facts,
-            dialect,
-            &substantial_closure_bodies,
-        );
+        if proto.source_frame.is_none() {
+            changed |= temp_inline::inline_temps_in_proto_with_facts(
+                proto,
+                readability,
+                facts,
+                dialect,
+                &substantial_closure_bodies,
+            );
+        }
         if let Some(slot) = substantial_closure_bodies.get_mut(proto_id) {
             *slot = temp_inline::proto_body_prefers_named_callee(&proto.body);
         }

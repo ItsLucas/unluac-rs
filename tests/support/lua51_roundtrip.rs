@@ -1,3 +1,4 @@
+//! 为端到端 Lua 回归隔离临时产物；并发执行器可能处于独立 PID 命名空间。
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,22 @@ pub(crate) struct Workspace(PathBuf);
 
 impl Workspace {
     pub(crate) fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "unluac-constructor-roundtrip-{}-{}",
-            std::process::id(),
-            WORKSPACE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create isolated regression workspace");
-        Self(path)
+        loop {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "unluac-constructor-roundtrip-{}-{}-{nonce}",
+                std::process::id(),
+                WORKSPACE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create isolated regression workspace: {error}"),
+            }
+        }
     }
 }
 

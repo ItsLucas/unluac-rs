@@ -610,6 +610,7 @@ mod tests {
 
     fn concat(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
         AstExpr::Binary(Box::new(AstBinaryExpr {
+            operand_order: None,
             op: AstBinaryOpKind::Concat,
             lhs,
             rhs,

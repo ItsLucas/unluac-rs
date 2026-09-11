@@ -1,5 +1,5 @@
 -- regress_263_repeat_tail_temp_inline#1: repeat尾条件的机械temp由HIR同轮内联
--- unluac: expect-contains [[until r0_0[r0_1] >= 1]]
+-- unluac: expect-contains [[until 1 <= r0_0[r0_1]]
 local values = {}
 local index = 1
 repeat

@@ -1,3 +1,4 @@
+//! 验证模块级连续构造的完整帧、字段调用、异常与 GC 时点；未证明的前后缀严格拒绝。
 use super::*;
 
 fn whole_proto(proto: &LoweredProto) -> Option<&[LowInstr]> {
@@ -103,49 +104,67 @@ Module417Rows = "old""#,
 }
 
 #[test]
-fn regressions_417_unproved_prefixes_and_calls_stay_rejected() {
+fn regressions_417_unused_local_prefixes_keep_their_slots_and_gc_lifetimes() {
     let workspace = Workspace::new();
     let source = include_str!("../regress-case/regress_417_module_record_calls.lua");
     for changed in [
-        source.replace("Module417Seed = ", "local previous = "),
-        source.replace(
-            "Module417Rows = {",
-            "Module417Side = 1\n    Module417Rows = {",
-        ),
+        source
+            .replace("Module417Seed = ", "local previous = ")
+            .replace(
+                "assert(#Module417Seed == 2 and Module417Seed[2].b == 3)",
+                "assert(Module417Seed == nil)",
+            ),
         source.replace(
             "Module417Rows = {",
             "local previous = Module417Unknown\n    Module417Rows = {",
         ),
-        source.replace(
-            "Module417Text(1, \"first\")",
-            "Module417Text(Module417Unknown, \"first\")",
-        ),
+    ] {
+        assert_roundtrip_trace(&workspace, &changed, whole_proto);
+    }
+}
+
+#[test]
+fn regressions_417_unproved_prefixes_and_calls_stay_rejected() {
+    let workspace = Workspace::new();
+    let source = include_str!("../regress-case/regress_417_module_record_calls.lua");
+    for changed in [
         source.replace(
             "Module417Text(1, \"first\")",
             "Module417Text(Module417More())",
         ),
         source.replace(
             "Module417Text(1, \"first\")",
-            "Module417Text(1, \"first\") + 1",
-        ),
-        source.replace(
-            "Module417Text(1, \"first\")",
             "Module417Text(nil, \"first\")",
-        ),
-        source.replace(
-            "Module417Text(1, \"first\")",
-            "Module417Library.text(1, \"first\")",
         ),
     ] {
         for strip in [true, false] {
             let bytes = compile(&workspace, &changed, strip);
-            let error = decompile(&bytes, options(NamingMode::Simple))
-                .expect_err("unproved prefix or noncanonical field call must stay rejected");
+            let Err(error) = decompile(&bytes, options(NamingMode::Simple)) else {
+                panic!("unproved prefix or noncanonical field call must stay rejected");
+            };
             assert!(
                 error.to_string().contains("residual table-set-list"),
                 "{error}"
             );
         }
+    }
+}
+
+#[test]
+fn regressions_433_module_field_calls_preserve_chains_arguments_and_arithmetic() {
+    let workspace = Workspace::new();
+    let source = include_str!("../regress-case/regress_417_module_record_calls.lua");
+    for replacement in [
+        "Module417Text(Module417Unknown, \"first\")",
+        "Module417Text(1, \"first\") + 1",
+        "Module417Library.text(1, \"first\")",
+    ] {
+        let changed = source
+            .replace("Module417Text(1, \"first\")", replacement)
+            .replace("function Module417Build()", "Module417Library = {text = Module417Text}\nfunction Module417Build()")
+            .replace("local result = {index = index, label = label}",
+                "local result = setmetatable({index = index, label = label}, {__add = function(left, right) collectgarbage('collect'); trace[#trace + 1] = 'add:' .. right; return left end})");
+        assert_roundtrip_trace(&workspace, &changed, whole_proto);
     }
 }
 

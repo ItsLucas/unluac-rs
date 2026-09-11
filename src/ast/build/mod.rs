@@ -222,6 +222,9 @@ impl<'a> AstLowerer<'a> {
         Ok(AstModule {
             entry_function: self.module.entry,
             body,
+            source_frame: self.module.protos[self.module.entry.index()]
+                .source_frame
+                .is_some(),
         })
     }
 
@@ -583,7 +586,13 @@ impl<'a> AstLowerer<'a> {
         attr: AstLocalAttr,
     ) -> AstLocalBinding {
         let proto = &self.module.protos[proto_index];
-        let origin = if proto.physical_root_locals.contains(&binding) {
+        let origin = if proto
+            .source_frame
+            .as_ref()
+            .is_some_and(|frame| frame.local_slots.contains_key(&binding))
+        {
+            AstLocalOrigin::FramePinned
+        } else if proto.physical_root_locals.contains(&binding) {
             AstLocalOrigin::PhysicalRoot
         } else if proto
             .local_debug_hints

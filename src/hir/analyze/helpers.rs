@@ -60,6 +60,7 @@ pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
     // 各自长出一份左折叠实现，最后再让后层被迫补括号。
     parts.into_iter().rfold(last, |rhs, lhs| {
         HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+            operand_order: None,
             op: crate::hir::common::HirBinaryOpKind::Concat,
             lhs,
             rhs,
@@ -68,7 +69,12 @@ pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
 }
 
 pub(super) fn binary_expr(op: HirBinaryOpKind, lhs: HirExpr, rhs: HirExpr) -> HirExpr {
-    HirExpr::Binary(Box::new(HirBinaryExpr { op, lhs, rhs }))
+    HirExpr::Binary(Box::new(HirBinaryExpr {
+        operand_order: None,
+        op,
+        lhs,
+        rhs,
+    }))
 }
 
 pub(super) fn decode_raw_string(raw: &crate::parser::RawString) -> String {
@@ -102,6 +108,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
         physical_root_locals: BTreeSet::new(),
+        source_frame: None,
         upvalues: Vec::new(),
         upvalue_debug_hints: Vec::new(),
         temps: Vec::new(),

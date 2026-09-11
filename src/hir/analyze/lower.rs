@@ -5,6 +5,8 @@
 //! copy 由 plan 执行器消费；单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，
 //! captured Luau shared closure 的词法 factory 由 `shared_closures.rs` 先冻结，再由这里
 //! 预留并填充 synthetic proto；避免主流程重新猜 closure identity。
+//! 完整源码帧恢复可能追加 pinned locals，故先恢复 body，再复制 bindings 进入 HirProto；
+//! 例如 R10 的单次读取 scene 声明必须连同槽位证书传递到 AST，不能由后层重新猜测。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -432,7 +434,7 @@ fn lower_proto_one(
             owned_open_producers[def.instr.index()] = true;
         }
     }
-    let lowering = ProtoLowering {
+    let mut lowering = ProtoLowering {
         target,
         proto,
         cfg,
@@ -446,6 +448,7 @@ fn lower_proto_one(
         owned_open_producers,
     };
 
+    let (body, source_frame) = build_proto_body(id, &mut lowering)?;
     artifacts.protos[id.index()] = HirProto {
         id,
         source: proto.source.as_ref().map(decode_raw_string),
@@ -456,12 +459,13 @@ fn lower_proto_one(
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
         physical_root_locals: BTreeSet::new(),
+        source_frame,
         upvalues: lowering.bindings.upvalues.clone(),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
-        body: build_proto_body(id, &lowering)?,
+        body,
         children: lowering.hir_children(),
         failure: None,
         detached_children: Vec::new(),
@@ -524,6 +528,7 @@ fn fill_failed_proto(
         locals,
         local_debug_hints,
         physical_root_locals: BTreeSet::new(),
+        source_frame: None,
         upvalues: (0..usize::from(proto.upvalues.common.count))
             .map(UpvalueId)
             .collect(),
@@ -867,6 +872,7 @@ fn build_composite_factory_proto(
         locals: (0..plan.nodes.len()).map(LocalId).collect(),
         local_debug_hints: vec![None; plan.nodes.len()],
         physical_root_locals: BTreeSet::new(),
+        source_frame: None,
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
         temps: Vec::new(),
@@ -1137,10 +1143,11 @@ impl ProtoLowering<'_> {
 
 fn build_proto_body(
     proto: HirProtoRef,
-    lowering: &ProtoLowering<'_>,
-) -> Result<HirBlock, HirLowerError> {
+    lowering: &mut ProtoLowering<'_>,
+) -> Result<(HirBlock, Option<crate::hir::common::HirSourceFrame>), HirLowerError> {
     let mut body = build_structured_body(proto, lowering)?;
-    super::array_constructor_regions::recover_canonical_arrays(&mut body, lowering);
+    let source_frame =
+        super::array_constructor_regions::recover_canonical_arrays(&mut body, lowering);
     let mut prefix = if lowering.bindings.debug_entry_local_decls.is_empty() {
         Vec::new()
     } else {
@@ -1171,5 +1178,5 @@ fn build_proto_body(
     );
     prefix.append(&mut body.stmts);
     body.stmts = prefix;
-    Ok(body)
+    Ok((body, source_frame))
 }

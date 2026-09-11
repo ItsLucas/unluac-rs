@@ -31,7 +31,10 @@ pub(super) fn collapse_adjacent_self_call_updates(
             continue;
         };
         if binding.attr != AstLocalAttr::None
-            || binding.origin == AstLocalOrigin::DebugHinted
+            || matches!(
+                binding.origin,
+                AstLocalOrigin::DebugHinted | AstLocalOrigin::FramePinned
+            )
             || use_index.count_uses_in_range(index, index + 1, binding.id) != 0
             || !matches!(initial, AstExpr::Call(_) | AstExpr::MethodCall(_))
         {

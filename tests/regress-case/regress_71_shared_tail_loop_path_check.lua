@@ -1,5 +1,5 @@
 -- regress_71_shared_tail_loop_path_check#1: shared-tail path proof follows owned loop exits
--- unluac: expect-contains [[while #p1_1 >= r1_0 do]]
+-- unluac: expect-contains [[while r1_0 <= #p1_1 do]]
 -- unluac: expect-contains [[print("shared-tail")]]
 -- unluac: expect-not-contains [[goto]]
 -- unluac: expect-not-contains [[::L]]

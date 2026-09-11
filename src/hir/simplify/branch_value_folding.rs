@@ -350,6 +350,7 @@ fn negated_nil_check_local(expr: &HirExpr) -> Option<LocalId> {
 
 fn nil_check_for_local(local: LocalId) -> HirExpr {
     HirExpr::Binary(Box::new(HirBinaryExpr {
+        operand_order: None,
         op: HirBinaryOpKind::Eq,
         lhs: HirExpr::LocalRef(local),
         rhs: HirExpr::Nil,

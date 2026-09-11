@@ -430,8 +430,11 @@ impl HirRewritePass for TableConstructorPass<'_> {
 }
 
 fn literal_allocation(constructor: &HirTableConstructor) -> Lua51TableAllocation {
-    let array_fields = constructor.fields.iter()
-        .filter(|field| matches!(field, HirTableField::Array(_))).count();
+    let array_fields = constructor
+        .fields
+        .iter()
+        .filter(|field| matches!(field, HirTableField::Array(_)))
+        .count();
     Lua51TableAllocation::from_field_counts(array_fields, constructor.fields.len() - array_fields)
 }
 

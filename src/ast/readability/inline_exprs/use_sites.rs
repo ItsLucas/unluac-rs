@@ -575,6 +575,7 @@ impl InlineSite {
             }
             InlinePolicy::Conservative => match candidate.origin() {
                 super::super::super::common::AstLocalOrigin::DebugHinted
+                | super::super::super::common::AstLocalOrigin::FramePinned
                 | super::super::super::common::AstLocalOrigin::PhysicalRoot => false,
                 super::super::super::common::AstLocalOrigin::Recovered => match self {
                     Self::CallCallee | Self::AccessBase => {

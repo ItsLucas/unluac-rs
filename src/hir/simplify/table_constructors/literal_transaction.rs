@@ -1,14 +1,10 @@
-//! Recover a whole raw literal, not independently "safe" object overwrites.
+//! 依靠原始物理写轨迹恢复完整字面量事务，不能逐项假定对象覆盖安全。
 //!
-//! Every first physical write must replace entry nil or a raw-proved primitive.
-//! Subsequent writes may replace
-//! transaction-owned tables only because all producers disappear into the same literal.
-//! Replaying Lua 5.1's pending-list register discipline must reproduce *every* write,
-//! record and SETLIST in order, including scratch roots left behind by nested records.
-//! Freshness alone would not suffice: a surviving child local can keep a later weak
-//! reference alive after its owner is cleared.
-//! Allocation hints are also part of the trace: a full SETLIST can precede trailing
-//! record fields, and moving a hash allocation across that boundary changes nil capacity.
+//! 首次物理写只能覆盖入口 nil 或原始事实证明的基本值；随后覆盖事务自有表时，
+//! 所有 producer 必须一起进入同一字面量。例如嵌套 record 留下的临时对象槽也须
+//! 按 Lua 5.1 待刷列表协议重放，逐次保留字段写、SETLIST 和分配 hint。
+//! freshness 不能代替存活期证明：残留 child local 会在 owner 清空后继续保活对象。
+//! 完整 SETLIST 后的记录字段也不能提前分配 hash 部分，否则会改变含 nil 表的布局。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -115,10 +111,7 @@ pub(super) fn rebuild_single_pass_literals(
     })
 }
 
-pub(super) fn rebuild_root_literals(
-    pass: &TableConstructorPass<'_>,
-    block: &mut HirBlock,
-) -> bool {
+pub(super) fn rebuild_root_literals(pass: &TableConstructorPass<'_>, block: &mut HirBlock) -> bool {
     if !pass.is_single_pass_root {
         return false;
     }

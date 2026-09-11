@@ -1,3 +1,4 @@
+//! 从官方源码编译取得 SSA 前缀，校验不可保留的调用根不会进入构造器帧证明。
 use super::*;
 use crate::decompile::{DecompileOptions, DecompileStage, GenerateMode, decompile};
 
@@ -7,8 +8,10 @@ fn prefix_proof_rejects_unread_or_single_use_call_roots_and_shifted_frames() {
         "lua5.1",
         "tests/regress-case/regress_397_effectful_array_regions.lua",
     );
-    let mut options = DecompileOptions::default();
-    options.target_stage = DecompileStage::Structure;
+    let mut options = DecompileOptions {
+        target_stage: DecompileStage::Structure,
+        ..DecompileOptions::default()
+    };
     options.generate.mode = GenerateMode::Strict;
     let state = decompile(&bytes, options).unwrap().state;
     let lowered = state.lowered.unwrap();
@@ -38,15 +41,21 @@ fn prefix_proof_rejects_unread_or_single_use_call_roots_and_shifted_frames() {
     let LowInstr::NewTable(root) = proto.instrs[start] else {
         unreachable!();
     };
-    assert!(canonical_prefix_keeps_frame(
-        proto, cfg, dataflow, start, root.dst
-    ));
-    assert!(!canonical_prefix_keeps_frame(
+    assert!(prefix_with_closed_arrays(
         proto,
         cfg,
         dataflow,
         start,
-        Reg(root.dst.index() + 1)
+        root.dst,
+        &[]
+    ));
+    assert!(!prefix_with_closed_arrays(
+        proto,
+        cfg,
+        dataflow,
+        start,
+        Reg(root.dst.index() + 1),
+        &[]
     ));
 
     let call = proto.instrs[..start]
@@ -56,19 +65,21 @@ fn prefix_proof_rejects_unread_or_single_use_call_roots_and_shifted_frames() {
     let def = dataflow.instr_defs[call][0];
     let mut fewer_reads = dataflow.clone();
     fewer_reads.def_uses[def.index()].truncate(1);
-    assert!(!canonical_prefix_keeps_frame(
+    assert!(!prefix_with_closed_arrays(
         proto,
         cfg,
         &fewer_reads,
         start,
-        root.dst
+        root.dst,
+        &[]
     ));
     fewer_reads.def_uses[def.index()].clear();
-    assert!(!canonical_prefix_keeps_frame(
+    assert!(!prefix_with_closed_arrays(
         proto,
         cfg,
         &fewer_reads,
         start,
-        root.dst
+        root.dst,
+        &[]
     ));
 }

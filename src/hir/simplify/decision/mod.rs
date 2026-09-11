@@ -111,8 +111,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
     for index in (0..nodes.len()).rev() {
         let node_ref = HirDecisionNodeRef(index);
         let mut node = nodes[index].clone();
-        let mut node_changed =
-            guard_chains::merge_single_entry_guard(&nodes, &incoming, &mut node);
+        let mut node_changed = guard_chains::merge_single_entry_guard(&nodes, &incoming, &mut node);
 
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
             && nodes

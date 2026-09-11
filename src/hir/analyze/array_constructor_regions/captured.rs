@@ -1,15 +1,17 @@
-//! Preserve an existing captured-local declaration and its upvalue identity.
+//! 在完整建表区间内保留既有捕获根的声明与 upvalue 身份。
 //!
-//! The entry-frame proof is unchanged. Only the root may escape; every scratch
-//! definition still belongs exclusively to the constructor. In particular, this
-//! does not reinterpret an assignment to an already open upvalue as a declaration.
+//! 本模块消费原始 SSA 与已经闭合的前序构造器：`local a={...}; local b={...}`
+//! 可连续恢复，每个根准确占一槽，临时定义只有自身从未捕获且无区间外使用才可消除。
+//! 后来的另一个根复用同一物理槽，不应反向把早先临时值当成捕获对象。
+//! 未证明的前序语句仍由入口帧门拒绝；不会将已有开放 upvalue 的赋值改成声明。
 
 use super::*;
 
 pub(super) fn captured_array_region(
     stmts: &[HirStmt],
     lowering: &ProtoLowering<'_>,
-) -> Option<(HirStmt, usize)> {
+    closed_arrays: &[ClosedArrayRegion],
+) -> Option<(HirStmt, usize, ClosedArrayRegion)> {
     let (target, values) = match stmts.first()? {
         HirStmt::LocalDecl(seed) if seed.bindings.len() == 1 => {
             (HirLValue::Local(seed.bindings[0]), &seed.values)
@@ -49,12 +51,13 @@ pub(super) fn captured_array_region(
         else {
             return false;
         };
-        canonical_prefix_keeps_frame(
+        prefix_with_closed_arrays(
             lowering.proto,
             lowering.cfg,
             lowering.dataflow,
             definition.instr.index(),
             seed.dst,
+            closed_arrays,
         )
     });
     let root = roots.next()?;
@@ -70,12 +73,13 @@ pub(super) fn captured_array_region(
         || lowering.bindings.lvalue_for_temp(root) != target
         || !lowering.bindings.reg_is_reference_captured(new_table.dst)
         || !lowering.dataflow.def_phi_uses[definition.id.index()].is_empty()
-        || !canonical_prefix_keeps_frame(
+        || !prefix_with_closed_arrays(
             lowering.proto,
             lowering.cfg,
             lowering.dataflow,
             start,
             new_table.dst,
+            closed_arrays,
         )
     {
         return None;
@@ -89,11 +93,9 @@ pub(super) fn captured_array_region(
         cursor: start,
         has_observable_producer: false,
         allow_open_tail: true,
+        rk_pool_full: false,
     };
     let expression = parser.table(0)?;
-    if !parser.has_observable_producer {
-        return None;
-    }
     let end = parser.cursor;
     // A later capture of a different definition in this physical register is not
     // evidence that this constructor root will retain a source-local home.
@@ -108,13 +110,6 @@ pub(super) fn captured_array_region(
     {
         return None;
     }
-    // A following function declaration starts at the next stack slot. Its capture
-    // mapping and all later uses of the original local remain entirely untouched.
-    if !matches!(parser.instruction()?, LowInstr::Closure(closure)
-        if closure.dst.index() == new_table.dst.index() + 1)
-    {
-        return None;
-    }
     let mut expected = Vec::new();
     for pc in start..end {
         for def in &lowering.dataflow.instr_defs[pc] {
@@ -124,9 +119,7 @@ pub(super) fn captured_array_region(
             let temp = TempId(def.index());
             if lowering.bindings.fixed_temps.get(def.index()) != Some(&temp)
                 || lowering.bindings.lvalue_for_temp(temp) != HirLValue::Temp(temp)
-                || lowering
-                    .bindings
-                    .reg_is_reference_captured(lowering.dataflow.def_reg(*def))
+                || definition_is_captured(lowering, *def)
                 || lowering
                     .bindings
                     .temp_debug_locals
@@ -156,5 +149,14 @@ pub(super) fn captured_array_region(
         HirStmt::Assign(assign) => assign.values = vec![expression].into(),
         _ => return None,
     }
-    Some((replacement, expected.len()))
+    Some((
+        replacement,
+        expected.len(),
+        ClosedArrayRegion {
+            start,
+            end,
+            root: new_table.dst,
+            retained: true,
+        },
+    ))
 }

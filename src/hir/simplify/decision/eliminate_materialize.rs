@@ -508,6 +508,7 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             (
                 prefix,
                 HirExpr::Binary(Box::new(HirBinaryExpr {
+                    operand_order: binary.operand_order,
                     op: binary.op,
                     lhs,
                     rhs,
@@ -582,6 +583,7 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
             expr: collapse_expr_to_pure(unary.expr)?,
         }))),
         HirExpr::Binary(binary) => Some(HirExpr::Binary(Box::new(HirBinaryExpr {
+            operand_order: binary.operand_order,
             op: binary.op,
             lhs: collapse_expr_to_pure(binary.lhs)?,
             rhs: collapse_expr_to_pure(binary.rhs)?,

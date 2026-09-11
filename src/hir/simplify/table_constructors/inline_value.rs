@@ -132,6 +132,7 @@ fn inline_constructor_value_at_site(
             )?,
         })),
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            operand_order: binary.operand_order,
             op: binary.op,
             lhs: inline_constructor_value_at_site(
                 context,

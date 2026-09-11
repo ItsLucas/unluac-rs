@@ -3,7 +3,7 @@
 //! HIR 已经进入“变量世界”，因此这里的核心职责是提供稳定的绑定身份、结构化
 //! 语句节点、保真的纯字面量以及少量受控 fallback 节点，供 AST/Readability/Naming 继续消费。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
@@ -34,6 +34,9 @@ pub struct HirProto {
     /// AST cleanup must not turn these declarations back into bare calls: the VM stack slot
     /// can keep the call result alive even when no HIR expression reads it.
     pub physical_root_locals: BTreeSet<LocalId>,
+    /// A complete Lua source-frame transaction already accounts for every statement.
+    /// Its declarations and expression trees must not be rewritten after recovery.
+    pub source_frame: Option<HirSourceFrame>,
     pub upvalues: Vec<UpvalueId>,
     pub upvalue_debug_hints: Vec<Option<String>>,
     pub temps: Vec<TempId>,
@@ -46,6 +49,12 @@ pub struct HirProto {
     pub failure: Option<ProtoFailure>,
     /// 失败父节点无法恢复原 closure 放置时，仍以诊断 local 展示的直接子 proto。
     pub detached_children: Vec<(LocalId, HirProtoRef)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirSourceFrame {
+    pub local_slots: BTreeMap<LocalId, usize>,
+    pub max_stack_size: u8,
 }
 
 /// proto 的稳定引用。
@@ -217,6 +226,15 @@ pub struct HirBinaryExpr {
     pub op: HirBinaryOpKind,
     pub lhs: HirExpr,
     pub rhs: HirExpr,
+    /// LT/LE 规范化后的两端仍须按已证明的源码求值和常量入池顺序输出。
+    pub operand_order: Option<RelationalOperandOrder>,
+}
+
+/// 关系式的源码操作数顺序；运算符的语义左右端保持规范化的 LT/LE 形式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationalOperandOrder {
+    LeftFirst,
+    RightFirst,
 }
 
 /// 逻辑短路表达式。

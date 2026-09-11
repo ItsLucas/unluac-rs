@@ -70,6 +70,7 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
             }
         }
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            operand_order: binary.operand_order,
             op: binary.op,
             lhs: normalize_candidate_expr(binary.lhs),
             rhs: normalize_candidate_expr(binary.rhs),

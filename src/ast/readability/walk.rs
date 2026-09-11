@@ -5,6 +5,8 @@
 //! 新 AST 节点一加，或者遍历边界一改，就要在一堆文件里同步返工。这里把纯遍历
 //! 样板收成共享设施，让 pass 更专注在“当前节点要不要改写”。repeat body 通过专用
 //! hook 暴露同作用域的 until 条件，避免块级分析漏掉正文之后的读取。
+//! 完整源码帧证书要求父函数的作用域与表达式保持原样：例如单次使用的 scene local
+//! 仍须占原槽。此类函数转入 preserved 遍历，只处理子函数体，不对父节点调用重写 hook。
 
 use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
@@ -15,6 +17,9 @@ use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
 };
+
+#[path = "walk_preserved.rs"]
+mod preserved;
 
 pub(super) trait AstRewritePass {
     fn enter_function(&mut self, _function: &AstFunctionExpr) {}
@@ -98,6 +103,11 @@ pub(super) trait ScopedAstRewritePass {
 }
 
 pub(super) fn rewrite_module(module: &mut AstModule, pass: &mut impl AstRewritePass) -> bool {
+    if module.source_frame {
+        return preserved::rewrite_functions(&mut module.body, &mut |function| {
+            rewrite_function_expr(function, BlockKind::FunctionBody, pass)
+        });
+    }
     rewrite_block_with_kind(&mut module.body, BlockKind::ModuleBody, pass)
 }
 
@@ -119,6 +129,11 @@ pub(super) fn rewrite_module_scoped<P: ScopedAstRewritePass>(
     scope: &P::Scope,
     pass: &mut P,
 ) -> bool {
+    if module.source_frame {
+        return preserved::rewrite_functions(&mut module.body, &mut |function| {
+            rewrite_function_expr_scoped(function, BlockKind::FunctionBody, scope, pass)
+        });
+    }
     rewrite_block_with_kind_scoped(&mut module.body, BlockKind::ModuleBody, scope, pass)
 }
 
@@ -328,6 +343,11 @@ fn rewrite_function_expr(
     kind: BlockKind,
     pass: &mut impl AstRewritePass,
 ) -> bool {
+    if function.source_frame {
+        return preserved::rewrite_functions(&mut function.body, &mut |child| {
+            rewrite_function_expr(child, BlockKind::FunctionBody, pass)
+        });
+    }
     pass.enter_function(function);
     let changed = rewrite_block_with_kind(&mut function.body, kind, pass);
     pass.leave_function(function);
@@ -340,6 +360,11 @@ fn rewrite_function_expr_scoped<P: ScopedAstRewritePass>(
     scope: &P::Scope,
     pass: &mut P,
 ) -> bool {
+    if function.source_frame {
+        return preserved::rewrite_functions(&mut function.body, &mut |child| {
+            rewrite_function_expr_scoped(child, BlockKind::FunctionBody, scope, pass)
+        });
+    }
     let function_scope = pass.enter_function(function, scope);
     rewrite_block_with_kind_scoped(&mut function.body, kind, &function_scope, pass)
 }

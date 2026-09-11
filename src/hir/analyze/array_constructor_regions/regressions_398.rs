@@ -1,3 +1,4 @@
+//! 从官方记录数组源码取得前缀事实，验证开放结果与未保留结果不能冒充稳定栈帧。
 use super::*;
 use crate::decompile::{DecompileOptions, DecompileStage, decompile};
 
@@ -7,8 +8,10 @@ fn ignored_calls_keep_the_frame_but_open_or_unread_results_do_not() {
         "lua5.1",
         "tests/regress-case/regress_398_record_lookup_regions.lua",
     );
-    let mut options = DecompileOptions::default();
-    options.target_stage = DecompileStage::Structure;
+    let options = DecompileOptions {
+        target_stage: DecompileStage::Structure,
+        ..DecompileOptions::default()
+    };
     let state = decompile(&bytes, options).unwrap().state;
     let lowered = state.lowered.unwrap();
     let index = lowered
@@ -37,8 +40,13 @@ fn ignored_calls_keep_the_frame_but_open_or_unread_results_do_not() {
     let LowInstr::NewTable(root) = proto.instrs[end] else {
         unreachable!()
     };
-    assert!(canonical_prefix_keeps_frame(
-        &proto, cfg, dataflow, end, root.dst
+    assert!(prefix_with_closed_arrays(
+        &proto,
+        cfg,
+        dataflow,
+        end,
+        root.dst,
+        &[]
     ));
     let call_pc = proto
         .instrs
@@ -51,12 +59,22 @@ fn ignored_calls_keep_the_frame_but_open_or_unread_results_do_not() {
     assert_eq!(call.results, ResultPack::Ignore);
     call.results = ResultPack::Open(call.callee);
     proto.instrs[call_pc] = LowInstr::Call(call);
-    assert!(!canonical_prefix_keeps_frame(
-        &proto, cfg, dataflow, end, root.dst
+    assert!(!prefix_with_closed_arrays(
+        &proto,
+        cfg,
+        dataflow,
+        end,
+        root.dst,
+        &[]
     ));
     call.results = ResultPack::Fixed(crate::transformer::RegRange::new(call.callee, 1));
     proto.instrs[call_pc] = LowInstr::Call(call);
-    assert!(!canonical_prefix_keeps_frame(
-        &proto, cfg, dataflow, end, root.dst
+    assert!(!prefix_with_closed_arrays(
+        &proto,
+        cfg,
+        dataflow,
+        end,
+        root.dst,
+        &[]
     ));
 }

@@ -168,7 +168,7 @@ impl InlineCandidate {
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            AstLocalOrigin::DebugHinted => false,
+            AstLocalOrigin::DebugHinted | AstLocalOrigin::FramePinned => false,
             AstLocalOrigin::PhysicalRoot => {
                 // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
                 // 持有同一函数值；把前置别名收回 callee 位不会缩短 GC 根，也不会改变

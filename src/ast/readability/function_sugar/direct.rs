@@ -123,6 +123,7 @@ pub(super) fn function_decl_target_from_lvalue(
         AstLValue::FieldAccess(access) => {
             let (root, mut fields) = name_path_from_expr(&access.base)?;
             if method_fields.contains(&access.field)
+                && !func.source_frame
                 && !func.params.is_empty()
                 && !function_captures_name_path_root(func, &root)
                 && !function_uses_global_name(func, "self")

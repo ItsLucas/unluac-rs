@@ -608,6 +608,7 @@ mod tests {
     fn literal_addition_fold_is_dialect_gated() {
         let add = || {
             HirExpr::Binary(Box::new(HirBinaryExpr {
+                operand_order: None,
                 op: HirBinaryOpKind::Add,
                 lhs: HirExpr::Integer(2),
                 rhs: HirExpr::Integer(3),

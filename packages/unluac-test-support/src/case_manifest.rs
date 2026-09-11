@@ -41,6 +41,30 @@ mod regressions_413_414;
 mod regressions_415;
 mod regressions_416;
 mod regressions_417;
+mod regressions_418;
+mod regressions_419;
+mod regressions_420;
+mod regressions_421;
+mod regressions_422;
+mod regressions_423;
+mod regressions_424;
+mod regressions_425;
+mod regressions_426;
+mod regressions_427;
+mod regressions_428;
+mod regressions_429;
+mod regressions_430;
+mod regressions_431;
+mod regressions_432;
+mod regressions_433;
+mod regressions_434;
+mod regressions_435;
+mod regressions_436;
+mod regressions_437;
+mod regressions_438;
+mod regressions_439;
+mod regressions_440;
+mod regressions_441;
 mod unit_cases;
 
 use regressions_001_100::REGRESSION_CASES_001_100;
@@ -76,6 +100,30 @@ use regressions_413_414::REGRESSION_CASES_413_414;
 use regressions_415::REGRESSION_CASES_415;
 use regressions_416::REGRESSION_CASES_416;
 use regressions_417::REGRESSION_CASES_417;
+use regressions_418::REGRESSION_CASES_418;
+use regressions_419::REGRESSION_CASES_419;
+use regressions_420::REGRESSION_CASES_420;
+use regressions_421::REGRESSION_CASES_421;
+use regressions_422::REGRESSION_CASES_422;
+use regressions_423::REGRESSION_CASES_423;
+use regressions_424::REGRESSION_CASES_424;
+use regressions_425::REGRESSION_CASES_425;
+use regressions_426::REGRESSION_CASES_426;
+use regressions_427::REGRESSION_CASES_427;
+use regressions_428::REGRESSION_CASES_428;
+use regressions_429::REGRESSION_CASES_429;
+use regressions_430::REGRESSION_CASES_430;
+use regressions_431::REGRESSION_CASES_431;
+use regressions_432::REGRESSION_CASES_432;
+use regressions_433::REGRESSION_CASES_433;
+use regressions_434::REGRESSION_CASES_434;
+use regressions_435::REGRESSION_CASES_435;
+use regressions_436::REGRESSION_CASES_436;
+use regressions_437::REGRESSION_CASES_437;
+use regressions_438::REGRESSION_CASES_438;
+use regressions_439::REGRESSION_CASES_439;
+use regressions_440::REGRESSION_CASES_440;
+use regressions_441::REGRESSION_CASES_441;
 use unit_cases::UNIT_CASES;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -404,6 +452,30 @@ pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
         REGRESSION_CASES_415,
         REGRESSION_CASES_416,
         REGRESSION_CASES_417,
+        REGRESSION_CASES_418,
+        REGRESSION_CASES_419,
+        REGRESSION_CASES_420,
+        REGRESSION_CASES_421,
+        REGRESSION_CASES_422,
+        REGRESSION_CASES_423,
+        REGRESSION_CASES_424,
+        REGRESSION_CASES_425,
+        REGRESSION_CASES_426,
+        REGRESSION_CASES_427,
+        REGRESSION_CASES_428,
+        REGRESSION_CASES_429,
+        REGRESSION_CASES_430,
+        REGRESSION_CASES_431,
+        REGRESSION_CASES_432,
+        REGRESSION_CASES_433,
+        REGRESSION_CASES_434,
+        REGRESSION_CASES_435,
+        REGRESSION_CASES_436,
+        REGRESSION_CASES_437,
+        REGRESSION_CASES_438,
+        REGRESSION_CASES_439,
+        REGRESSION_CASES_440,
+        REGRESSION_CASES_441,
     ]
     .into_iter()
     .flat_map(manifest_entries)

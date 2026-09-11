@@ -565,6 +565,7 @@ mod tests {
 
     fn equals(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
         AstExpr::Binary(Box::new(AstBinaryExpr {
+            operand_order: None,
             op: AstBinaryOpKind::Eq,
             lhs,
             rhs,

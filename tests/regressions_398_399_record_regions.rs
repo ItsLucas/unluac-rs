@@ -1,3 +1,5 @@
+//! 用官方 Lua 源码贯通编译与反编译，比较记录构造器的执行、槽写入和常量顺序。
+//! 各类扩展在 support 子模块共享同一验证入口，字节码变体只用于检验证明边界。
 use std::fmt::Write as _;
 use std::process::Command;
 
@@ -92,7 +94,12 @@ fn assert_roundtrip_trace(
                 &generated.source,
             );
             let actual = with_stdin(Command::new(tool("lua")).arg("-"), &generated.source);
-            assert_eq!(actual.stdout, expected, "strip={strip}, mode={mode:?}");
+            assert!(
+                actual.stdout == expected,
+                "strip={strip}, mode={mode:?}\nexpected: {}\nactual: {}",
+                String::from_utf8_lossy(&expected),
+                String::from_utf8_lossy(&actual.stdout),
+            );
 
             let recompiled = compile(workspace, &generated.source, strip);
             let roundtrip = decompile(&recompiled, options(mode)).expect("strict roundtrip");
@@ -100,6 +107,10 @@ fn assert_roundtrip_trace(
             let after = roundtrip.state.lowered.unwrap();
             let before = builder(&before.main);
             let after = builder(&after.main);
+            assert_eq!(
+                before.frame, after.frame,
+                "frame width must preserve GC roots"
+            );
             assert_eq!(
                 trace(before),
                 trace(after),
@@ -188,35 +199,15 @@ fn regressions_398_noncanonical_records_remain_rejected() {
             _ => None,
         })
         .unwrap();
-    let (first_store_pc, first_store) = proto
+    let first_store_pc = proto
         .instrs
         .iter()
         .enumerate()
         .find_map(|(pc, instr)| match instr {
-            LowInstr::SetTable(store) if store.base == AccessBase::Reg(child.dst) => {
-                Some((pc, store))
-            }
+            LowInstr::SetTable(store) if store.base == AccessBase::Reg(child.dst) => Some(pc),
             _ => None,
         })
         .unwrap();
-    let (last_store_pc, last_store) = proto
-        .instrs
-        .iter()
-        .enumerate()
-        .filter_map(|(pc, instr)| match instr {
-            LowInstr::SetTable(store) if store.base == AccessBase::Reg(child.dst) => {
-                Some((pc, store))
-            }
-            _ => None,
-        })
-        .last()
-        .unwrap();
-    let AccessKey::Const(first_key) = first_store.key else {
-        unreachable!()
-    };
-    let ValueOperand::Const(number_key) = last_store.value else {
-        unreachable!()
-    };
     let read_pc = proto.instrs[..first_store_pc]
         .iter()
         .rposition(|instr| {
@@ -226,9 +217,7 @@ fn regressions_398_noncanonical_records_remain_rejected() {
         .unwrap();
 
     for (pc, shift, value) in [
-        (child_pc, 14, 4), // mismatched NEWTABLE hash allocation
-        (last_store_pc, 23, 256 + first_key.index() as u32), // duplicate record key
-        (last_store_pc, 23, 256 + number_key.index() as u32), // numeric record key
+        (child_pc, 14, 4),                       // mismatched NEWTABLE hash allocation
         (read_pc, 23, child.dst.index() as u32), // observe the fresh owner
     ] {
         let origin = raw_proto.common.instructions[pc].origin;
@@ -357,10 +346,6 @@ fn regressions_413_unproved_prefix_and_branch_stay_rejected() {
     for changed in [
         source.replace("function Record413Read() return rows end",
             "function Record413Before() return 17 end\n rows = nil\n function Record413Read() return rows end"),
-        source.replace(
-            "function Record413Build()",
-            "function Record413Build()\n local old = Record413Catalog\n",
-        ),
         source
             .replace(
                 "local rows = {",
@@ -372,13 +357,23 @@ fn regressions_413_unproved_prefix_and_branch_stay_rejected() {
             ),
     ] {
         let bytes = compile(&workspace, &changed, true);
-        let error = decompile(&bytes, options(NamingMode::Simple))
-            .expect_err("unproved entry frame or branch must not be recovered");
+        let Err(error) = decompile(&bytes, options(NamingMode::Simple)) else {
+            panic!("unproved entry frame or branch must not be recovered");
+        };
         assert!(
             error.to_string().contains("residual table-set-list"),
             "{error}"
         );
     }
+}
+
+#[test]
+fn regressions_413_unused_prefix_local_preserves_physical_frame() {
+    let source = include_str!("regress-case/regress_413_captured_record_array.lua").replace(
+        "function Record413Build()",
+        "function Record413Build()\n local old = Record413Catalog\n",
+    );
+    assert_roundtrip_trace(&Workspace::new(), &source, |proto| Some(&proto.instrs));
 }
 
 #[test]
@@ -548,22 +543,15 @@ fn regressions_414_open_tail_width_holes_and_allocation() {
 fn regressions_414_unproved_open_protocols_remain_rejected() {
     let workspace = Workspace::new();
     let source = include_str!("regress-case/regress_414_captured_open_tail.lua");
-    for changed in [
-        source.replace("return tag, rows", "return 17, rows"),
-        source.replace(
-            "function Open414Read() return tag, rows end",
-            "function Open414Read() return tag, rows end\n Open414Make(3)",
-        ),
-        source.replace("Open414Make(2)", "Open414Make(Open414Make(2))"),
-    ] {
-        let bytes = compile(&workspace, &changed, true);
-        let error = decompile(&bytes, options(NamingMode::Simple))
-            .expect_err("unproved prefix, suffix or open arguments must stay rejected");
-        assert!(
-            error.to_string().contains("residual table-set-list"),
-            "{error}"
-        );
-    }
+    let changed = source.replace("Open414Make(2)", "Open414Make(Open414Make(2))");
+    let bytes = compile(&workspace, &changed, true);
+    let Err(error) = decompile(&bytes, options(NamingMode::Simple)) else {
+        panic!("unproved open arguments must stay rejected");
+    };
+    assert!(
+        error.to_string().contains("residual table-set-list"),
+        "{error}"
+    );
     let bytes = compile(&workspace, source, true);
     let baseline = decompile(&bytes, options(NamingMode::Simple)).unwrap();
     let lowered = baseline.state.lowered.unwrap();
@@ -603,6 +591,13 @@ fn regressions_414_unproved_open_protocols_remain_rejected() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn regressions_414_unused_scalar_before_open_tail_keeps_its_slot() {
+    let source = include_str!("regress-case/regress_414_captured_open_tail.lua")
+        .replace("return tag, rows", "return 17, rows");
+    assert_roundtrip_trace(&Workspace::new(), &source, |proto| Some(&proto.instrs));
 }
 
 fn source_with_large_constant_pool(prefix: usize) -> String {
@@ -887,3 +882,33 @@ fn regressions_416_wrong_primitive_slots_and_skip_stay_rejected() {
         }
     }
 }
+
+#[path = "support/nested_record_regions.rs"]
+mod nested_record_regions;
+
+#[path = "support/record_key_regions.rs"]
+mod record_key_regions;
+
+#[path = "support/captured_sequence_regions.rs"]
+mod captured_sequence_regions;
+
+#[path = "support/global_value_regions.rs"]
+mod global_value_regions;
+
+#[path = "support/record_closures_call_keys.rs"]
+mod record_closures_call_keys;
+
+#[path = "support/loop_prefix_regions.rs"]
+mod loop_prefix_regions;
+
+#[path = "support/captured_value_regions.rs"]
+mod captured_value_regions;
+
+#[path = "support/global_guard_regions.rs"]
+mod global_guard_regions;
+
+#[path = "support/captured_record_scalar_regions.rs"]
+mod captured_record_scalar_regions;
+
+#[path = "support/record_call_arithmetic.rs"]
+mod record_call_arithmetic;

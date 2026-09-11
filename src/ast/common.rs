@@ -30,6 +30,7 @@ impl AstSyntheticLocalId {
 pub struct AstModule {
     pub entry_function: HirProtoRef,
     pub body: AstBlock,
+    pub source_frame: bool,
 }
 
 /// AST 语句块。
@@ -167,6 +168,7 @@ pub struct AstReturn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstFunctionExpr {
     pub function: HirProtoRef,
+    pub source_frame: bool,
     pub params: Vec<ParamId>,
     pub is_vararg: bool,
     pub named_vararg: Option<AstBindingRef>,
@@ -460,6 +462,8 @@ pub enum AstLocalOrigin {
     DebugHinted,
     /// HIR proved that this recovered declaration keeps a physical VM root alive.
     PhysicalRoot,
+    /// A full source-frame certificate requires the declaration at its original slot.
+    FramePinned,
 }
 
 /// 全局声明属性。
@@ -496,6 +500,8 @@ pub struct AstBinaryExpr {
     pub op: AstBinaryOpKind,
     pub lhs: AstExpr,
     pub rhs: AstExpr,
+    /// 来自 HIR 的关系式操作数顺序，输出层不得用显示偏好覆盖该事实。
+    pub operand_order: Option<crate::hir::RelationalOperandOrder>,
 }
 
 /// 逻辑表达式。

@@ -66,6 +66,7 @@ fn lower_branch_subject_with(
             lhs,
             rhs,
         } => HirExpr::Binary(Box::new(HirBinaryExpr {
+            operand_order: None,
             op: match predicate {
                 BranchPredicate::Eq => HirBinaryOpKind::Eq,
                 BranchPredicate::Lt => HirBinaryOpKind::Lt,
